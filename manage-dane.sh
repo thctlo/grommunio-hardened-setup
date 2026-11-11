@@ -103,22 +103,8 @@ show_help()
     sed -n '3,62p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
-# "mx1" for whichever domain is first_active_domain() (it has no
-# mail.<domain>-shaped hostname of its own that could serve this - that
-# name means the shared server identity for it specifically, see
-# dns-records-reference.md). "mail" for every other domain - it already
-# has its own mail.<domain> A/AAAA from normal domain setup, nothing new
-# to create there.
-dane_label_for()
-{
-    local domain="$1" first
-    first="$(first_active_domain)"
-    if [[ "$domain" == "$first" ]]; then
-        echo "mx1"
-    else
-        echo "mail"
-    fi
-}
+# dane_label_for() now lives in functions/00-common.sh - shared with
+# manage-mta-sts.sh, which needs the exact same per-domain MX hostname.
 
 have_transip_creds()
 {

@@ -36,19 +36,43 @@
 # domain to "enforce" by hand later (edit that domain's own policy file),
 # once confirmed working.
 #
+# Each domain's policy "mx:" field must match that domain's own real MX
+# record - NOT necessarily this server's own global hostname. A domain
+# whose mail.<domain> collides with this server's own canonical hostname
+# gets a dedicated "mx1.<domain>" MX instead (see dane_label_for() in
+# functions/00-common.sh, shared with manage-dane.sh - same reasoning:
+# its PTR is set to mx1.<domain> specifically so it matches Postfix's own
+# HELO name). cmd_generate() computes this correctly for files it writes,
+# but - by design - never touches a policy file that already exists, so
+# a file written before this per-domain logic existed can be stuck with
+# the wrong mx forever. --status detects that; --reconfigure fixes it.
+#
 # Usage:
 #   manage-mta-sts.sh                Show this help (no arguments = help).
 #   manage-mta-sts.sh --all          Recompute the full domain list and
 #                                    write/update each domain's own policy
 #                                    file + nginx server block to match.
+#                                    Never overwrites an existing policy
+#                                    file's content - see --reconfigure.
 #   manage-mta-sts.sh -domain <name> Same, but fail loudly if this one
 #                                    domain's mta-sts.<domain> hostname
 #                                    does not resolve here.
-#   manage-mta-sts.sh --validate     Check DNS (_mta-sts TXT + mta-sts.
-#                                    A/AAAA) and the live-served policy
-#                                    file for every active domain; report
-#                                    what is still missing (DNS is never
-#                                    fixed by this script, by design).
+#   manage-mta-sts.sh --status       Check DNS (_mta-sts TXT), the
+#                                    live-served policy file, and that
+#                                    its "mx:" value matches this domain's
+#                                    real MX record, for every active
+#                                    domain; report what is missing or
+#                                    wrong. Read-only, changes nothing.
+#                                    (--validate is a kept alias.)
+#   manage-mta-sts.sh --reconfigure  Like --all, but also FIXES an
+#                                    existing policy file's "mx:" line if
+#                                    it does not match this domain's real
+#                                    MX record - the one thing --all
+#                                    deliberately never touches. Preserves
+#                                    that file's "mode:"/"max_age:"
+#                                    exactly as they are (an enforce-mode
+#                                    promotion, or a hand-tuned max_age,
+#                                    survives).
 
 set -euo pipefail
 
@@ -57,9 +81,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/functions/00-common.sh"
 
 NET_CFG="$(cfg_file 10-network-hostname)"
-NEW_FQDN="" PRIMARY_IPV4="" PRIMARY_IPV6=""
+PRIMARY_IPV4="" PRIMARY_IPV6=""
 [[ -f "$NET_CFG" ]] && source "$NET_CFG"
-MX_HOST="${NEW_FQDN:-mail.example.com}"
 
 POLICY_ROOT="/var/www/mta-sts"
 NGINX_CONF="/etc/nginx/conf.d/mta-sts.conf"
@@ -67,7 +90,7 @@ DEFAULT_MAX_AGE=604800   # 1 week
 
 show_help()
 {
-    sed -n '3,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,75p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 resolves_here()
@@ -107,44 +130,31 @@ wanted_domains()
     done
 }
 
-# ============================================================
-# cmd_generate: for every domain in scope, write/keep its own policy file
-# and its own nginx server block. A domain's existing policy file is never
-# overwritten if it already exists (so a hand-edited "enforce" switch, or
-# a domain-specific mx/max_age, survives every re-run) - only missing
-# domains get a fresh "testing" default written.
-# ============================================================
-
-cmd_generate()
+# policy_mx_for <domain>: the correct "mx:" value for that domain's own
+# MTA-STS policy - its real MX hostname, via the same dane_label_for()
+# this server's DANE setup uses (functions/00-common.sh), NOT this
+# server's own global hostname. Using the wrong value here is exactly
+# the bug --status/--reconfigure exist to catch and fix (see the header
+# comment above).
+policy_mx_for()
 {
-    require_cmd resolvectl
+    local domain="$1"
+    echo "$(dane_label_for "$domain").${domain}"
+}
 
-    local -a domains=()
-    while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
-    [[ "${#domains[@]}" -gt 0 ]] || die "No mta-sts.<domain> hostname resolves to this server - nothing to configure."
-
-    local changed=0 d policy_file server_block_file
-
-    for d in "${domains[@]}"; do
-        install -d -m 0755 "${POLICY_ROOT}/${d}/.well-known"
-        policy_file="${POLICY_ROOT}/${d}/.well-known/mta-sts.txt"
-        if [[ -f "$policy_file" ]]; then
-            log "[ OK ] $d: $policy_file already exists - left as-is (edit it by hand for mode/mx/max_age changes)."
-        else
-            printf 'version: STSv1\nmode: testing\nmx: %s\nmax_age: %s\n' "$MX_HOST" "$DEFAULT_MAX_AGE" > "$policy_file"
-            chmod 0644 "$policy_file"
-            changed=1
-            log "[ OK ] $d: wrote $policy_file (mode: testing, mx: $MX_HOST)."
-        fi
-    done
-
-    # One nginx conf FILE, but one independent server{} block PER DOMAIN -
-    # never a shared block/shared server_name list, so one domain's block
-    # can diverge (e.g. its own cert, its own root) without touching any
-    # other domain's block. Rebuilt from scratch every run, matching the
-    # full current domain list exactly (a domain that stops resolving
-    # here is dropped here too, not left stale).
-    local conf_new
+# _mta_sts_rebuild_nginx_conf: one nginx conf FILE, but one independent
+# server{} block PER DOMAIN - never a shared block/shared server_name
+# list, so one domain's block can diverge (e.g. its own cert, its own
+# root) without touching any other domain's block. Rebuilt from scratch
+# every run, matching the full current domain list exactly (a domain
+# that stops resolving here is dropped here too, not left stale). Shared
+# by cmd_generate and cmd_reconfigure - both need the exact same nginx
+# side, only the policy-file side differs between them. Returns via the
+# global $_changed (set to 1 if anything was written/reloaded).
+_mta_sts_rebuild_nginx_conf()
+{
+    local -a domains=("$@")
+    local conf_new d
     conf_new="$(mktemp)"
     {
         echo "# Managed by manage-mta-sts.sh - do not edit by hand."
@@ -173,14 +183,51 @@ cmd_generate()
         backup_file "$NGINX_CONF"
         install -m 0644 "$conf_new" "$NGINX_CONF"
         finalize_backup "$NGINX_CONF"
-        changed=1
+        _changed=1
         log "[ OK ] Wrote $NGINX_CONF with ${#domains[@]} domain-specific server block(s)."
     else
         log "[ OK ] $NGINX_CONF already up to date."
     fi
     rm -f "$conf_new"
+}
 
-    if [[ "$changed" -eq 1 ]]; then
+# ============================================================
+# cmd_generate: for every domain in scope, write/keep its own policy file
+# and its own nginx server block. A domain's existing policy file is never
+# overwritten if it already exists (so a hand-edited "enforce" switch, or
+# a domain-specific mx/max_age, survives every re-run) - only missing
+# domains get a fresh "testing" default written, with the correct
+# per-domain mx (policy_mx_for). A file that already exists with the
+# WRONG mx is left untouched here on purpose - see --reconfigure.
+# ============================================================
+
+cmd_generate()
+{
+    require_cmd resolvectl
+
+    local -a domains=()
+    while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
+    [[ "${#domains[@]}" -gt 0 ]] || die "No mta-sts.<domain> hostname resolves to this server - nothing to configure."
+
+    local _changed=0 d policy_file mx_host
+
+    for d in "${domains[@]}"; do
+        install -d -m 0755 "${POLICY_ROOT}/${d}/.well-known"
+        policy_file="${POLICY_ROOT}/${d}/.well-known/mta-sts.txt"
+        if [[ -f "$policy_file" ]]; then
+            log "[ OK ] $d: $policy_file already exists - left as-is (edit it by hand for mode/mx/max_age changes, or run --status/--reconfigure to check/fix just the mx value)."
+        else
+            mx_host="$(policy_mx_for "$d")"
+            printf 'version: STSv1\nmode: testing\nmx: %s\nmax_age: %s\n' "$mx_host" "$DEFAULT_MAX_AGE" > "$policy_file"
+            chmod 0644 "$policy_file"
+            _changed=1
+            log "[ OK ] $d: wrote $policy_file (mode: testing, mx: $mx_host)."
+        fi
+    done
+
+    _mta_sts_rebuild_nginx_conf "${domains[@]}"
+
+    if [[ "$_changed" -eq 1 ]]; then
         nginx -t || die "nginx -t failed after the MTA-STS config change."
         systemctl reload nginx || die "nginx did not reload."
         log "[ OK ] nginx reloaded."
@@ -188,10 +235,73 @@ cmd_generate()
 }
 
 # ============================================================
-# cmd_validate: DNS + live-served-policy check, no changes made.
+# cmd_reconfigure: like cmd_generate, but also FIXES an existing policy
+# file's "mx:" line if it does not match policy_mx_for() - the one thing
+# cmd_generate deliberately never touches. Preserves that file's
+# "mode:"/"max_age:" exactly as they are (an enforce-mode promotion, or
+# a hand-tuned max_age, survives). Missing files are created fresh,
+# same as cmd_generate.
 # ============================================================
 
-cmd_validate()
+cmd_reconfigure()
+{
+    require_cmd resolvectl
+
+    local -a domains=()
+    while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
+    [[ "${#domains[@]}" -gt 0 ]] || die "No mta-sts.<domain> hostname resolves to this server - nothing to configure."
+
+    local _changed=0 d policy_file expected_mx actual_mx mode max_age
+
+    for d in "${domains[@]}"; do
+        install -d -m 0755 "${POLICY_ROOT}/${d}/.well-known"
+        policy_file="${POLICY_ROOT}/${d}/.well-known/mta-sts.txt"
+        expected_mx="$(policy_mx_for "$d")"
+
+        if [[ ! -f "$policy_file" ]]; then
+            printf 'version: STSv1\nmode: testing\nmx: %s\nmax_age: %s\n' "$expected_mx" "$DEFAULT_MAX_AGE" > "$policy_file"
+            chmod 0644 "$policy_file"
+            _changed=1
+            log "[ OK ] $d: wrote $policy_file (mode: testing, mx: $expected_mx)."
+            continue
+        fi
+
+        actual_mx="$(grep -E '^mx:' "$policy_file" | awk '{print $2}')"
+        if [[ "$actual_mx" == "$expected_mx" ]]; then
+            log "[ OK ] $d: $policy_file already has the correct mx ($expected_mx) - left as-is."
+            continue
+        fi
+
+        mode="$(grep -E '^mode:' "$policy_file" | awk '{print $2}')"
+        max_age="$(grep -E '^max_age:' "$policy_file" | awk '{print $2}')"
+        mode="${mode:-testing}"
+        max_age="${max_age:-$DEFAULT_MAX_AGE}"
+
+        backup_file "$policy_file"
+        printf 'version: STSv1\nmode: %s\nmx: %s\nmax_age: %s\n' "$mode" "$expected_mx" "$max_age" > "$policy_file"
+        chmod 0644 "$policy_file"
+        finalize_backup "$policy_file"
+        _changed=1
+        log "[FIX ] $d: $policy_file had mx '$actual_mx', corrected to '$expected_mx' (mode: $mode, max_age: $max_age preserved)."
+    done
+
+    _mta_sts_rebuild_nginx_conf "${domains[@]}"
+
+    if [[ "$_changed" -eq 1 ]]; then
+        nginx -t || die "nginx -t failed after the MTA-STS config change."
+        systemctl reload nginx || die "nginx did not reload."
+        log "[ OK ] nginx reloaded."
+    else
+        log "[ OK ] Nothing needed fixing."
+    fi
+}
+
+# ============================================================
+# cmd_status: DNS + live-served-policy + mx-correctness check, no
+# changes made. (--validate is a kept alias for this same command.)
+# ============================================================
+
+cmd_status()
 {
     require_cmd resolvectl
     require_cmd curl
@@ -199,7 +309,7 @@ cmd_validate()
     local -a all_domains=()
     while read -r d; do [[ -n "$d" ]] && all_domains+=("$d"); done < <(all_active_domains)
 
-    local d failed=0 txt policy_url served
+    local d failed=0 txt policy_url served expected_mx actual_mx
     for d in "${all_domains[@]}"; do
         echo
         echo "=== $d ==="
@@ -219,6 +329,15 @@ cmd_validate()
             if [[ -n "$served" ]]; then
                 echo "[ OK ] Policy served at $policy_url:"
                 sed 's/^/       /' <<< "$served"
+
+                expected_mx="$(policy_mx_for "$d")"
+                actual_mx="$(grep -E '^mx:' <<< "$served" | awk '{print $2}')"
+                if [[ "$actual_mx" == "$expected_mx" ]]; then
+                    echo "[ OK ] Served mx ($actual_mx) matches this domain's real MX hostname."
+                else
+                    echo "[FAIL] Served mx is '$actual_mx', should be '$expected_mx' (run --reconfigure to fix)."
+                    failed=$((failed + 1))
+                fi
             else
                 echo "[FAIL] Could not fetch $policy_url (nginx not configured? run --all first)."
                 failed=$((failed + 1))
@@ -230,7 +349,7 @@ cmd_validate()
 
     echo
     if [[ "$failed" -eq 0 ]]; then
-        log "[ OK ] No missing pieces found for any domain whose DNS already points here."
+        log "[ OK ] No issues found for any domain whose DNS already points here."
     else
         err "$failed issue(s) found - see [FAIL] lines above."
         return 1
@@ -254,8 +373,10 @@ while [[ $# -gt 0 ]]; do
         -domain)
             [[ -n "${2:-}" ]] || die "-domain needs a value."
             ACTION="domain"; TARGET_DOMAIN="$2"; shift 2 ;;
-        --validate)
-            ACTION="validate"; shift ;;
+        --status|--validate)
+            ACTION="status"; shift ;;
+        --reconfigure)
+            ACTION="reconfigure"; shift ;;
         -h|--help)
             show_help; exit 0 ;;
         *)
@@ -279,8 +400,11 @@ case "$ACTION" in
         resolves_here "mta-sts.$TARGET_DOMAIN" || die "mta-sts.$TARGET_DOMAIN does not resolve to this server."
         cmd_generate
         ;;
-    validate)
-        cmd_validate
+    status)
+        cmd_status
+        ;;
+    reconfigure)
+        cmd_reconfigure
         ;;
     *)
         show_help

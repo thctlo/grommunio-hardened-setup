@@ -300,3 +300,24 @@ first_active_domain()
         | sort -n -k1,1 \
         | awk 'NR==1{print $2}'
 }
+
+# dane_label_for: the correct mail-hostname LABEL for a domain's own MX
+# record. "mx1" for whichever domain is first_active_domain() (it has no
+# mail.<domain>-shaped hostname of its own that could serve this - that
+# name means the shared server identity for it specifically, see
+# dns-records-reference.md; its PTR record is also set to mx1.<domain>
+# specifically so it matches Postfix's own HELO name). "mail" for every
+# other domain - it already has its own mail.<domain> A/AAAA from normal
+# domain setup, nothing new to create there. Shared by manage-dane.sh and
+# manage-mta-sts.sh - both need the same real MX hostname per domain, and
+# must never derive it two different ways.
+dane_label_for()
+{
+    local domain="$1" first
+    first="$(first_active_domain)"
+    if [[ "$domain" == "$first" ]]; then
+        echo "mx1"
+    else
+        echo "mail"
+    fi
+}
