@@ -83,6 +83,15 @@ DRY_RUN_RETRY_INTERVAL=30
 # separated, empty string disables the feature entirely.
 PROTECTED_PACKAGES="grommunio-archive"
 
+# Optional local override, never tracked in this repo: a deployment
+# that maintains its own additional forked/rebuilt packages (beyond
+# what this public repo documents) can list them here instead of
+# editing this script directly, so a `git pull` of this repo never
+# clobbers that server's real list.
+PROTECTED_PACKAGES_OVERRIDE_FILE="/etc/apt/install-unattended-upgrades.local.conf"
+# shellcheck disable=SC1090
+[[ -f "$PROTECTED_PACKAGES_OVERRIDE_FILE" ]] && source "$PROTECTED_PACKAGES_OVERRIDE_FILE"
+
 # Where to mail when a protected package has a pending change. Default:
 # hostmaster@<this server's own DNS domain> - already a real, deliverable
 # alias on this project's admin hub mailbox (see 31-grommunio-domain.sh).
