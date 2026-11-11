@@ -1,0 +1,7 @@
+[Unit]
+Description=Ensure every active user has the TRAIN-HAM folder
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/bin/ensure-train-ham-folders.sh --all
