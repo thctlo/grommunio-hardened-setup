@@ -18,15 +18,22 @@
 #      REPO_DIR. This step then:
 #        a. configures the community repo (see option 2), if not already done
 #        b. verifies REPO_DIR exists and contains .deb files
-#        c. generates Packages(.gz) with dpkg-scanpackages
+#        c. generates Packages(.gz) and a minimal Release file (with a
+#           unique Origin: this repo, and only this repo, ever sets)
+#           with dpkg-scanpackages
 #        d. adds `deb [trusted=yes] file://REPO_DIR ./` (trusted=yes
 #           because the files arrived over a channel we already trust,
 #           scp/ssh) ALONGSIDE the community source, not instead of it
 #        e. pins that local repo to a higher priority than community
-#           (APT preferences, `Pin: origin ""` - the standard way to
-#           target a local/file-based source with no Release Origin
-#           field) so a package present in BOTH resolves from the
-#           local repo, and anything only in community still resolves
+#           (APT preferences, `Pin: release o=personal-build` -
+#           matches the Release file's Origin written in step c, NOT
+#           "any source with no hostname" - that broader match was
+#           tried first and turned out to also match Debian's own
+#           base/backports sources when those are configured via a
+#           `mirror+file://` URI, see the pin's own comment further
+#           down in this file for the full story) so a package present
+#           in BOTH resolves from the local repo, and anything only in
+#           community (or Debian's own base/backports) still resolves
 #           from there, with zero package-name list to maintain
 #        f. apt-get update, then verifies grommunio-setup still
 #           resolves from community AND at least one package from
@@ -46,6 +53,7 @@ step_apt_repo_personal()
 {
 local PERSONAL_SOURCES="/etc/apt/sources.list.d/personal.list"
 local PERSONAL_PIN_FILE="/etc/apt/preferences.d/90-personal-repo"
+local PERSONAL_REPO_ORIGIN="personal-build"
 local COMMUNITY_SOURCES="/etc/apt/sources.list.d/grommunio.sources"
 local COMMUNITY_KEYRING="/usr/share/keyrings/download.grommunio.com.gpg"
 local COMMUNITY_URL="https://download.grommunio.com/community/Debian_13"
@@ -245,6 +253,38 @@ configure_personal()
     gzip -kf "$REPO_DIR/Packages"
     log "Wrote $REPO_DIR/Packages(.gz)"
 
+    # A minimal Release file with a unique Origin, so the pin below can
+    # target THIS repo specifically (see the pin comment further down
+    # for why that precision matters - a bare "local source" match is
+    # not specific enough). Includes real MD5Sum/SHA256 entries for
+    # Packages/Packages.gz - without them apt logs a "No Hash entry"
+    # warning on every update (found live: this warning did not exist
+    # before this repo had a Release file at all, and a warning that
+    # wasn't there before is worth actually fixing, not just living
+    # with, now that the file exists anyway).
+    (
+        cd "$REPO_DIR"
+        {
+            echo "Origin: ${PERSONAL_REPO_ORIGIN}"
+            echo "Label: ${PERSONAL_REPO_ORIGIN}"
+            echo "Suite: personal"
+            echo "Codename: personal"
+            echo "Components: main"
+            echo "Architectures: $(dpkg --print-architecture) all"
+            echo "Date: $(date -Ru)"
+            echo "MD5Sum:"
+            for f in Packages Packages.gz; do
+                printf ' %s %16d %s\n' "$(md5sum "$f" | cut -d' ' -f1)" "$(stat -c%s "$f")" "$f"
+            done
+            echo "SHA256:"
+            for f in Packages Packages.gz; do
+                printf ' %s %16d %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(stat -c%s "$f")" "$f"
+            done
+        } > Release
+    )
+    chmod 644 "$REPO_DIR/Release"
+    log "Wrote $REPO_DIR/Release (Origin: ${PERSONAL_REPO_ORIGIN})."
+
     # One of the package names actually in REPO_DIR, used below to verify
     # pinning really took effect (not hardcoded to e.g. grommunio-archive,
     # since REPO_DIR's actual contents vary by server). Read from the
@@ -261,23 +301,44 @@ configure_personal()
     finalize_backup "$PERSONAL_SOURCES"
     log "Wrote $PERSONAL_SOURCES (added alongside $COMMUNITY_SOURCES, not instead of it)."
 
-    # Pin: origin "" matches a local/file-based source with no Release
-    # Origin field (exactly what dpkg-scanpackages produces - a flat
-    # repo has no Release file at all) - the standard APT mechanism for
-    # "prefer this local archive's packages over every other configured
-    # source, for whichever packages it actually has." Priority 900 (not
-    # >1000): prefer it when a package exists in both, but don't force a
-    # downgrade if this pool is ever stale relative to community for the
-    # same package - a real possibility since the pool is a manual copy,
-    # not kept live in sync automatically.
+    # REAL BUG FOUND AND FIXED LIVE 2026-11-12: this pin originally used
+    # `Pin: origin ""` (matches any source with no hostname - the
+    # standard way to prefer "a local archive"). That is NOT specific
+    # enough: Debian's own base sources can ALSO be configured via a
+    # `mirror+file://` URI (a local mirror-selection file, confirmed
+    # live on testvps's own /etc/apt/sources.list.d/debian.sources,
+    # covering trixie/trixie-updates/trixie-security/trixie-backports
+    # all at once) - which APT ALSO treats as hostname-less for pin
+    # purposes. The old pin silently raised trixie-backports to the
+    # same priority as stable (900, tied with everything else), which
+    # would let apt pull a backports version of ANY package server-wide
+    # on the next upgrade - confirmed live via apt-cache policy showing
+    # every Debian suite, backports included, pinned to 900. No actual
+    # package had been upgraded yet when this was caught, but
+    # install-unattended-upgrades.sh runs unattended and would have hit
+    # this on its own schedule.
+    #
+    # Fixed to `Pin: release o=${PERSONAL_REPO_ORIGIN}` instead - this
+    # matches a Release file's own "Origin:" field (an arbitrary label,
+    # unrelated to hostname matching - see apt_preferences(5) for the
+    # explicit distinction between the two), which only the Release
+    # file written above sets to this exact value. Verified in an
+    # isolated apt sandbox with a real mirror+file-style source present
+    # alongside the personal repo: the fixed pin leaves the mirror+file
+    # source at its normal priority (500) and only raises the personal
+    # repo's own packages to 900.
     backup_file "$PERSONAL_PIN_FILE"
     cat > "$PERSONAL_PIN_FILE" <<EOF
 # Managed by 25-apt-repo-personal.sh - do not edit by hand.
 # Prefers this server's own local package pool over the grommunio
 # community repo, for whichever packages it actually contains. Anything
-# NOT in the local pool is unaffected and still resolves from community.
+# NOT in the local pool is unaffected and still resolves from community
+# (or any other configured source, e.g. Debian's own base/backports -
+# this pin is scoped to this repo's own Release Origin specifically,
+# not to "any local source" - see the comment above for why that
+# distinction matters).
 Package: *
-Pin: origin ""
+Pin: release o=${PERSONAL_REPO_ORIGIN}
 Pin-Priority: 900
 EOF
     chmod 644 "$PERSONAL_PIN_FILE"
