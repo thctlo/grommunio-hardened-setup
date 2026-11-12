@@ -27,9 +27,12 @@ up from there and closes the gaps a production deployment actually needs:
   user-profile fixes the official adaptor scripts don't apply on their own.
 - **A real WAF and brute-force defense** — ModSecurity (OWASP CRS) in
   front of every vhost, tuned with real false-positive exclusions found
-  live, plus fail2ban jails for every exposed service, including a
-  subnet-aggregating jail that catches distributed brute-force attempts
-  spread across many IPs in the same network block.
+  live, plus 20 fail2ban jails covering every exposed service, including
+  a subnet-aggregating jail that catches distributed brute-force attempts
+  spread across many IPs in the same network block, and a `recidive` jail
+  that escalates repeat offenders caught by any of the others. See
+  [`docs/fail2ban-jails-reference.md`](docs/fail2ban-jails-reference.md)
+  for the full list.
 - **Nothing gets overwritten without a trace** — every file a step
   creates or changes is backed up first, to `/root/backups/<run
   timestamp>/<original path>`, with a manifest listing exactly what
@@ -163,10 +166,12 @@ anything this framework invents:
 | `manage-certs.sh` | Keeps the shared Let's Encrypt certificate's SAN list in sync with every active domain |
 | `manage-dane.sh` / `update-dane-tlsa.sh` | DANE/TLSA setup and automatic re-publishing on renewal |
 | `manage-dkim.sh` | DKIM key generation and DNS record output |
-| `manage-mta-sts.sh` | MTA-STS policy file + nginx + DNS validation |
+| `manage-mta-sts.sh` | MTA-STS policy file + nginx wiring; `--status` validates DNS/served policy/mx correctness, `--reconfigure` fixes a wrong mx without resetting mode/max_age |
 | `manage-mfa.sh` | Per-user opt-in MFA (TOTP) via Keycloak |
 | `fix-keycloak-json-perm.sh` | Installed as an apt hook; guards against a real upstream permission regression |
 | `f2b-subnet-detect.sh` | Resolves an IP's real registered network block for fail2ban's subnet-ban action |
+| `ensure-train-ham-folders.sh` | Creates the TRAIN-HAM folder for users grommunio-admin has no hook for; also installed as a daily timer by step 38 |
+| `install-unattended-upgrades.sh` | Unattended-upgrades setup with a protected-package pre-flight check (optional local override file for site-specific additions) |
 
 ## Project structure
 
