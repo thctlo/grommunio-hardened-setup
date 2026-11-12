@@ -226,7 +226,7 @@ else
         echo "grommunio-chat-v10 shared/grommunio/auto-config boolean true"
         echo "grommunio-chat-v10 shared/grommunio-chat/endpoint-url string https://${FQDN}/chat"
         echo "grommunio-chat-v10 shared/grommunio-chat/listen-address string 127.0.0.1:8065"
-        echo "grommunio-chat-v10 shared/grommunio-chat/api-tls-verify boolean false"
+        echo "grommunio-chat-v10 shared/grommunio-chat/api-tls-verify boolean true"
         echo "grommunio-chat-v10 shared/grommunio/admin-password password ${CHAT_ADMIN_PASSWORD}"
         echo "grommunio-chat-v10 shared/grommunio/admin-password-again password ${CHAT_ADMIN_PASSWORD}"
         echo "grommunio-chat-v10 grommunio-chat-v10/database-type select pgsql"
