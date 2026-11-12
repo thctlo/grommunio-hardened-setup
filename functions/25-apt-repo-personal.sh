@@ -64,18 +64,24 @@ require_cmd apt-get
 # pkg_candidate_source <pkg>: prints the source line apt would actually
 # install FROM for <pkg>'s current candidate version - not just "is this
 # source listed somewhere in the output" (true even for a losing,
-# lower-priority entry) and not "***" (apt-cache policy only marks an
-# INSTALLED version that way, never shown on a fresh system with
-# nothing installed yet - exactly this step's own situation). Finds the
-# "Candidate: X" line, then the line directly below wherever the
-# version table lists exactly X.
+# lower-priority entry) and not "***" (apt-cache policy only prefixes
+# an INSTALLED version with that, so it's absent on a fresh system
+# with nothing installed yet, but present - shifting every field one
+# over - when the package is already installed, found live on testvps
+# where grommunio-setup already was). Only starts matching after the
+# "Version table:" line, so the "Installed:"/"Candidate:" summary
+# lines above it (which also contain the version string as a field)
+# can never be mistaken for a version-table entry.
 pkg_candidate_source()
 {
     local pkg="$1" out cand
     out="$(apt-cache policy "$pkg" 2>/dev/null)"
     cand="$(awk '/^  Candidate:/{print $2}' <<< "$out")"
     [[ -n "$cand" ]] || return 1
-    awk -v v="$cand" '$1==v{getline; print; exit}' <<< "$out"
+    awk -v v="$cand" '
+        /^  Version table:/ { intable=1; next }
+        intable && ($1==v || $2==v) { getline; print; exit }
+    ' <<< "$out"
 }
 
 # ============================================================
