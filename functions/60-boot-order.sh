@@ -20,6 +20,10 @@
 #     "gx_generic_connect timer_agent@[unix:/run/gromox/timer.sock]:6666: No
 #     such file or directory" on every boot where gromox-timer's socket was
 #     not yet there (found in a full post-reboot log sweep, 2026-10-24).
+#     Moot since: gromox itself removed the gromox-timer service entirely
+#     (upstream commit 69f94c5, confirmed absent from a current install) -
+#     the ordering entries for it are gone from this script too, not just
+#     filtered out at runtime.
 #
 # How readiness is handled: a oneshot unit per slow service (grommunio-*-ready)
 # runs curl with --retry, which keeps trying until the service answers. nginx
@@ -120,13 +124,12 @@ local -a SPEC=(
     "postfix.service|$DB saslauthd.service var-spool-postfix-run-mysqld.mount $FW|$DB saslauthd.service"
     "gromox-zcore.service|$DB $FW gromox-event.service|$DB gromox-event.service"
     "gromox-midb.service|$DB $FW gromox-event.service|$DB gromox-event.service"
-    "gromox-http.service|$DB $FW gromox-event.service gromox-timer.service|$DB gromox-event.service gromox-timer.service"
+    "gromox-http.service|$DB $FW gromox-event.service|$DB gromox-event.service"
     "gromox-imap.service|$DB $FW gromox-event.service|$DB gromox-event.service"
     "gromox-pop3.service|$DB $FW gromox-event.service|$DB gromox-event.service"
     "gromox-delivery.service|$DB $FW gromox-event.service|$DB gromox-event.service"
     "gromox-delivery-queue.service|$DB $FW gromox-event.service|$DB gromox-event.service"
     "gromox-event.service|$DB $FW|$DB"
-    "gromox-timer.service|$DB $FW gromox-event.service|$DB gromox-event.service"
     "grommunio-chat.service|postgresql.service $FW|postgresql.service"
     "grommunio-chat-ready.service|grommunio-chat.service|grommunio-chat.service"
     "grommunio-keycloak-ready.service|grommunio-keycloak.service|grommunio-keycloak.service"
