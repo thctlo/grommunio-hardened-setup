@@ -950,6 +950,24 @@ if [[ -f "$SPAMRUN_CFG" ]]; then
 fi
 if [[ -x /root/bin/ensure-train-ham-folders.sh ]]; then
     /root/bin/ensure-train-ham-folders.sh --all || die "ensure-train-ham-folders.sh --all failed."
+
+    # Install the daily timer too - the one-time --all run above only
+    # catches users that already exist right now. Without this timer,
+    # a user created later never gets the folder until someone re-runs
+    # this step by hand (found live 2026-10-28: 0 of 19 users had it,
+    # all created/restored after this step had last run).
+    local TRAIN_HAM_SVC="/root/bin/ensure-train-ham-folders.service"
+    local TRAIN_HAM_TIMER="/root/bin/ensure-train-ham-folders.timer"
+    if [[ -f "$TRAIN_HAM_SVC" && -f "$TRAIN_HAM_TIMER" ]]; then
+        install -m 0644 "$TRAIN_HAM_SVC" /etc/systemd/system/ensure-train-ham-folders.service
+        install -m 0644 "$TRAIN_HAM_TIMER" /etc/systemd/system/ensure-train-ham-folders.timer
+        systemctl daemon-reload
+        systemctl enable --now ensure-train-ham-folders.timer \
+            || die "Could not enable ensure-train-ham-folders.timer."
+        log "[ OK ] Installed and enabled ensure-train-ham-folders.timer (daily, catches users created after today)."
+    else
+        log "[WARN] ensure-train-ham-folders.service/.timer not found next to ensure-train-ham-folders.sh - the daily check will not run, only today's one-time pass above."
+    fi
 else
     log "[WARN] /root/bin/ensure-train-ham-folders.sh not found - deploy it separately to create $HAM_FOLDER for active users."
 fi
