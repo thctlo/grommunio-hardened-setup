@@ -580,7 +580,11 @@ specifically because of this).
   CBC ciphers) to match nginx and gromox-imap/pop3 - Postfix's
   defaults otherwise still offered deprecated TLS 1.0/1.1 and CBC,
   flagged as "potentially VULNERABLE to LUCKY13" by an external scan.
-  Applied once in `main.cf`, covering ports 25/587/465 uniformly.
+  Applied once in `main.cf`, covering ports 25/587/465 uniformly. Sets
+  `smtpd_tls_loglevel=1` too (Postfix's own default is 0) - one
+  summary line per connection (protocol, cipher, key-exchange,
+  signature), useful for spotting a real client compatibility problem
+  without the much noisier per-record dumps higher levels add.
 - Blocks SHA-1 as a TLS 1.2 signature algorithm, prompted by an
   external mail-security scan report - verified live with a
   SHA-1-only TLS offer actually failing and a SHA-256 offer still
