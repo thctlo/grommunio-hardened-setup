@@ -328,27 +328,47 @@ exist (`command -v gpg`, etc.).
 
 ### Step 25 — Where packages come from
 
-**What it does:** adds the APT source and signing key for grommunio's
-**community package repository** (`download.grommunio.com`,
-`Debian_13` suite) and nothing else.
+**What it does:** always adds the APT source and signing key for
+grommunio's **community package repository**
+(`download.grommunio.com`, `Debian_13` suite) - that part is never
+skipped, regardless of which option you pick below. The choice is
+only about whether a *second* source gets layered on top of it:
+
+1. **Community only** (option 2) - just the above, nothing else.
+2. **Community + your own rebuilt packages** (option 1, default) -
+   additionally registers a local, file-based repo (a package pool
+   you've copied onto this server yourself) and pins it *above*
+   community via APT preferences (`Pin: origin ""`, priority 900 -
+   the standard way to prefer a local archive). This is selective and
+   automatic: whatever package names actually exist in your local
+   pool resolve from there; every other package - `grommunio-setup`,
+   `grommunio-chat-v10`, `grommunio-auth`, everything - still resolves
+   from community, with no list of package names to maintain by hand.
+   This step verifies both halves after `apt-get update`: that
+   `grommunio-setup`'s candidate still comes from community, and that
+   one package from your local pool actually resolves from there (not
+   silently shadowed by a higher community version - priority wins
+   over version number here, so a stale local pool is still preferred,
+   which is itself a reason to keep it refreshed).
 
 **Why:** this is the one step with a real choice in it - see the box
-below.
+below for when option 1 is actually useful.
 
 **Result:** `apt-cache policy grommunio-setup` shows a candidate
-version coming from `download.grommunio.com`; `apt-get update` runs
-without errors.
+version coming from `download.grommunio.com` either way; if using
+option 1, `apt-cache policy <your-package>` shows its candidate coming
+from `file://<your repo dir>` instead, at priority 900 in the version
+table; `apt-get update` runs without errors.
 
-> **Using the author's own rebuilt packages instead?** A small number
-> of packages in this stack are maintained as separate, independent
+> **Using the author's own rebuilt packages too?** A small number of
+> packages in this stack are maintained as separate, independent
 > rebuilds rather than taken from the community repo as-is. This is
-> **entirely optional** and not needed for a working install - skip
-> straight to Step 30 unless you specifically want this. See
-> [`custom-repo/README.md`](custom-repo/README.md) for that separate
-> path: it replaces *only* the packages that differ, on top of the
-> same community repo, not instead of it. A couple of these are kept
-> private - personal, modified-for-own-use builds, not part of this
-> public path at all (see that page's own note).
+> **entirely optional** and not needed for a working install - choose
+> option 2 above and skip straight to Step 30 unless you specifically
+> want this. See [`custom-repo/README.md`](custom-repo/README.md) for
+> how to set up the local pool option 1 expects. A couple of these are
+> kept private - personal, modified-for-own-use builds, not part of
+> this public path at all (see that page's own note).
 
 ---
 

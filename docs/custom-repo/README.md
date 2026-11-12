@@ -35,9 +35,11 @@ anywhere else, personal.
 ## Setting it up
 
 This adds a *second* apt source alongside the community one from Step
-25 - it does not replace it; only the specific package names above
-ever come from here, everything else still resolves from the
-community repo as normal.
+25 - it does not replace it. Only the specific package names your own
+pool actually contains ever come from there; everything else still
+resolves from the community repo as normal, enforced by APT pinning
+(not just "whichever source happens to have it" - see below for why
+that distinction matters).
 
 ```
 # on the build/package host, or wherever you build these from source -
@@ -56,9 +58,26 @@ orchestration layer for building/publishing these, kept separate from
 this one since it's about *maintaining* packages, not installing a
 server.)
 
-Then, on the mail server itself, add that repo as an additional apt
-source (same pattern Step 25 uses for the community one, see
-`functions/25-apt-repo-personal.sh` for the exact mechanism) and
-`apt-get install grommunio-archive`/`python3-certbot-dns-transip` as
-normal - apt resolves each one from whichever configured source
-currently has it.
+Then, on the mail server itself, copy the resulting pool of `.deb`
+files anywhere (e.g. `scp -r` from the build host's
+`/srv/apt-repo/pool`) and run **Step 25**
+(`functions/25-apt-repo-personal.sh`) choosing **option 1** - pointing
+it at that directory when asked. That one step does everything else:
+generates the package index, adds the local repo as a second apt
+source, and writes an APT preferences file pinning it above community
+(`Pin: origin ""`, priority 900 - the standard way to prefer a local
+archive, matching no hostname so it can never accidentally also match
+community's own HTTPS source). Priority, not version number, decides
+the winner: a package present in both resolves from your local pool
+even if community's copy has a higher version number - intentional,
+since your own pool is a manual copy that can otherwise go stale
+unnoticed, but it also means you should refresh the pool (re-copy the
+`.deb`s, re-run Step 25) when you actually want a newer upstream
+version for one of these packages specifically. The step verifies both
+halves worked before finishing: `grommunio-setup`'s candidate still
+comes from community, and at least one of your own pool's packages
+resolves from the local repo instead.
+
+After that: `apt-get install grommunio-archive`/
+`python3-certbot-dns-transip` as normal - `apt-cache policy <package>`
+shows exactly which source each one's candidate comes from.
