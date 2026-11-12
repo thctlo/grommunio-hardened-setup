@@ -225,6 +225,12 @@ local -A TLS_HARDENING=(
     [smtpd_tls_mandatory_exclude_ciphers]="aNULL, CBC"
     [smtp_tls_exclude_ciphers]="aNULL, CBC"
     [smtp_tls_mandatory_exclude_ciphers]="aNULL, CBC"
+    # 1, not Postfix's own default 0: logs one summary line per
+    # connection (protocol, cipher, key-exchange, signature) - enough to
+    # spot a real compatibility problem (found live 2026-11-12/13 during
+    # a scanner/Gmail compatibility round) without the much noisier
+    # per-record hex/ASCII dumps level 2+ adds.
+    [smtpd_tls_loglevel]="1"
 )
 local TLS_HARDENING_CHANGED=0
 local tls_param tls_want tls_have
