@@ -241,9 +241,13 @@ configure_personal()
 
     # One of the package names actually in REPO_DIR, used below to verify
     # pinning really took effect (not hardcoded to e.g. grommunio-archive,
-    # since REPO_DIR's actual contents vary by server).
+    # since REPO_DIR's actual contents vary by server). Read from the
+    # Packages index just generated above, not a filesystem find - a
+    # real repo pool is typically nested (pool/main/<letter>/<pkg>/...,
+    # reprepro's own layout, confirmed live on testvps), so a shallow
+    # find here found nothing and crashed this step entirely.
     local sample_pkg
-    sample_pkg="$(dpkg-deb -f "$(find "$REPO_DIR" -maxdepth 1 -name '*.deb' | head -1)" Package 2>/dev/null)"
+    sample_pkg="$(awk -F': ' '/^Package:/{print $2; exit}' "$REPO_DIR/Packages")"
 
     backup_file "$PERSONAL_SOURCES"
     echo "deb [trusted=yes] file://${REPO_DIR} ./" > "$PERSONAL_SOURCES"
