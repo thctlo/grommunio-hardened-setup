@@ -539,8 +539,6 @@ echo "     the SAME admin password grommunio-setup already gave you."
 echo "  7. Watch token refresh: journalctl -u gromox-zcore -f (guide says"
 echo "     refresh happens roughly every 280s and should not force a re-login)."
 echo
-echo "I'm ready when you want to drive the browser part."
-echo
 
     # Chat (step 34) sets up its Keycloak SSO here if chat was installed before Keycloak.
     if dpkg -s grommunio-chat-v10 >/dev/null 2>&1 && [[ -n "$SHARED_ADMIN_PASSWORD" ]]; then
