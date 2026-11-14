@@ -362,10 +362,10 @@ fi
 # what it always should have.
 SHA1_CHECK_OK="$(echo | timeout 8 openssl s_client -connect 127.0.0.1:25 -starttls smtp \
     -tls1_2 -cipher 'ECDHE-ECDSA-AES256-GCM-SHA384:@SECLEVEL=0' -sigalgs 'ECDSA+SHA256' 2>/dev/null \
-    | grep -c 'Cipher is ECDHE')"
+    | grep -c 'Cipher is ECDHE' || true)"
 SHA1_CHECK_BLOCKED="$(echo | timeout 8 openssl s_client -connect 127.0.0.1:25 -starttls smtp \
     -tls1_2 -cipher 'ECDHE-ECDSA-AES256-GCM-SHA384:@SECLEVEL=0' -sigalgs 'ECDSA+SHA1' 2>/dev/null \
-    | grep -c 'Cipher is ECDHE')"
+    | grep -c 'Cipher is ECDHE' || true)"
 if [[ "$SHA1_CHECK_OK" -eq 1 && "$SHA1_CHECK_BLOCKED" -eq 0 ]]; then
     log "[ OK ] Verified live: SHA-256 signature offer works, SHA-1-only offer is refused."
 else
