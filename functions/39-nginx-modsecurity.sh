@@ -637,63 +637,87 @@ EOF
         log "[ OK ] grommunio-files DAV anomaly-score-threshold exclusion already present in $excl (or file missing)."
     fi
 
+    # One-time migration: a first version of the exclusion below shipped
+    # briefly live 2026-11-14, gated on REQUEST_METHOD @streq PUT - verified
+    # NOT to work (see the comment on the replacement further down for why),
+    # so a plain `grep -q 'id:9000026,'` presence check would wrongly treat
+    # that broken version as "already done" and never replace it. Removes
+    # the stale lines by exact line range (computed fresh each run, not a
+    # fragile text pattern) before the real exclusion below is written.
+    if [[ -f "$excl" ]] && grep -q 'SecRule REQUEST_METHOD "@streq PUT"' "$excl" && grep -q 'id:9000026,' "$excl"; then
+        local stale_start stale_end
+        stale_start="$(grep -n '# grommunio-files WebDAV (webdav + dav endpoints) PUT uploads: remove rules' "$excl" | head -n1 | cut -d: -f1)"
+        if [[ -n "$stale_start" ]]; then
+            stale_end="$(tail -n "+$stale_start" "$excl" | grep -n '^        ctl:ruleRemoveById=920340"$' | sed -n '2p' | cut -d: -f1)"
+            if [[ -n "$stale_end" ]]; then
+                stale_end=$((stale_start + stale_end - 1))
+                sed -i "${stale_start},${stale_end}d" "$excl"
+                log "Removed the stale, method-gated version of the WebDAV 920170/920340 exclusion (was lines ${stale_start}-${stale_end})."
+            fi
+        fi
+    fi
+
     # Real false positive found live 2026-11-14: every WebDAV PUT upload via
     # grommunio-files' DAV endpoint was blocked outright (400), confirmed via
     # the modsec audit log and by reading the real CRS rule source (not
     # guessed). Rule 920170 ("GET or HEAD Request with Body Content") has
     # REQUEST_METHOD @rx ^(?:GET|HEAD)$ as the FIRST link of its own chain -
     # it should be structurally impossible for a PUT to match this at all,
-    # yet it fired on every PUT tested (HTTP/1.1 and HTTP/2 both, so not an
-    # HTTP-version parsing quirk) - a genuine method-detection bug in this
-    # ModSecurity/nginx-connector/libmodsecurity3 combination, not something
-    # a config change here can actually correct. 920340 ("Missing
-    # Content-Type header") is a real, if low-severity (NOTICE), match for a
-    # plain `curl -T` upload, which never sets Content-Type - likely true of
-    # some real WebDAV clients too. id:9000024/9000025 above (requestBodyAccess
-    # and the aggregate-score threshold) do not help here: both 920170/920340
-    # are phase:2 HEADER checks, evaluated before - and independent of -
-    # request body access, and raising the aggregate threshold did not
-    # prevent the block either (only two low-combined-severity rules matched
-    # per the audit log, well under even the raised threshold, yet it still
-    # blocked - suggests the threshold bump was not the deciding factor here
-    # at all). Removing these two rule IDs outright for PUT on both DAV
-    # endpoints, same mechanism as the 921110/PROPFIND fix above
-    # (id:9000022), is the direct, verified-pattern fix - not a body or score
-    # tuning knob that turned out not to apply here.
+    # yet it fired on every PUT tested. 920340 ("Missing Content-Type
+    # header") is a real, if low-severity (NOTICE), match for a plain
+    # `curl -T` upload, which never sets Content-Type - likely true of some
+    # real WebDAV clients too.
+    #
+    # First attempt at this fix (now replaced) chained the exclusion on
+    # REQUEST_METHOD @streq PUT, same style as id:9000020/9000024 above -
+    # verified live NOT to work: nginx's own access log correctly logged
+    # "PUT ... 400" for the exact same request the modsec audit log logged
+    # one line later as "GET ... 400" (identical timestamp, identical URI).
+    # ModSecurity/this connector reports the wrong method for this request
+    # somewhere in its own pipeline - which also explains why 920170 (method
+    # @rx GET|HEAD) fires on a real PUT in the first place. A chain gated on
+    # REQUEST_METHOD @streq PUT can never match if ModSecurity itself never
+    # sees "PUT" for this request either - so that version of the exclusion
+    # was a silent no-op, confirmed by the exact same two rules still firing
+    # after it was deployed and nginx reloaded (checked worker process start
+    # time, not just the service's ActiveEnterTimestamp, which does not
+    # change on a reload).
+    #
+    # Fixed by dropping the method gate entirely - matching id:9000011/
+    # id:9000025's own style (URI-only, no REQUEST_METHOD chain) - and
+    # removing both rule IDs for this URI regardless of what method
+    # ModSecurity thinks it saw.
     if [[ -f "$excl" ]] && ! grep -q 'id:9000026,' "$excl"; then
         cat >> "$excl" <<'EOF'
 
-# grommunio-files WebDAV (webdav + dav endpoints) PUT uploads: remove rules
+# grommunio-files WebDAV (webdav + dav endpoints) uploads: remove rules
 # 920170 and 920340 outright - found 2026-11-14, every WebDAV PUT upload was
 # blocked (400). 920170 fired despite its own chain requiring REQUEST_METHOD
-# to be GET/HEAD (confirmed by reading the real CRS rule source) - a genuine
-# method-detection bug in this ModSecurity/connector combination, not
-# something fixable here except by excluding it. 920340 (missing
-# Content-Type on a body-bearing request) is a real but low-severity
-# (NOTICE) match for this upload style. Method-scoped via chain so other
-# verbs on these paths keep both rules active.
-SecRule REQUEST_METHOD "@streq PUT" \
+# to be GET/HEAD (confirmed by reading the real CRS rule source) - this
+# connector reports the wrong method for this request somewhere in its own
+# pipeline (confirmed: nginx's access log said PUT, the modsec audit log
+# said GET for the exact same request), so a method-gated version of this
+# exclusion cannot work either - not scoped by method here, unlike
+# id:9000020/9000024 above. 920340 (missing Content-Type on a body-bearing
+# request) is a real but low-severity (NOTICE) match for this upload style.
+SecRule REQUEST_URI "@beginsWith /files/remote.php/webdav" \
     "id:9000026,\
     phase:1,\
     pass,\
     nolog,\
-    chain"
-    SecRule REQUEST_URI "@beginsWith /files/remote.php/webdav" \
-        "ctl:ruleRemoveById=920170,\
-        ctl:ruleRemoveById=920340"
-SecRule REQUEST_METHOD "@streq PUT" \
+    ctl:ruleRemoveById=920170,\
+    ctl:ruleRemoveById=920340"
+SecRule REQUEST_URI "@beginsWith /files/remote.php/dav" \
     "id:9000027,\
     phase:1,\
     pass,\
     nolog,\
-    chain"
-    SecRule REQUEST_URI "@beginsWith /files/remote.php/dav" \
-        "ctl:ruleRemoveById=920170,\
-        ctl:ruleRemoveById=920340"
+    ctl:ruleRemoveById=920170,\
+    ctl:ruleRemoveById=920340"
 EOF
-        log "Added the WebDAV (webdav+dav) PUT rule-920170/920340 exclusion to $excl."
+        log "Added the WebDAV (webdav+dav) rule-920170/920340 exclusion to $excl."
     else
-        log "[ OK ] WebDAV (webdav+dav) PUT rule-920170/920340 exclusion already present in $excl (or file missing)."
+        log "[ OK ] WebDAV (webdav+dav) rule-920170/920340 exclusion already present in $excl (or file missing)."
     fi
     finalize_backup "$excl"
 
