@@ -636,6 +636,65 @@ EOF
     else
         log "[ OK ] grommunio-files DAV anomaly-score-threshold exclusion already present in $excl (or file missing)."
     fi
+
+    # Real false positive found live 2026-11-14: every WebDAV PUT upload via
+    # grommunio-files' DAV endpoint was blocked outright (400), confirmed via
+    # the modsec audit log and by reading the real CRS rule source (not
+    # guessed). Rule 920170 ("GET or HEAD Request with Body Content") has
+    # REQUEST_METHOD @rx ^(?:GET|HEAD)$ as the FIRST link of its own chain -
+    # it should be structurally impossible for a PUT to match this at all,
+    # yet it fired on every PUT tested (HTTP/1.1 and HTTP/2 both, so not an
+    # HTTP-version parsing quirk) - a genuine method-detection bug in this
+    # ModSecurity/nginx-connector/libmodsecurity3 combination, not something
+    # a config change here can actually correct. 920340 ("Missing
+    # Content-Type header") is a real, if low-severity (NOTICE), match for a
+    # plain `curl -T` upload, which never sets Content-Type - likely true of
+    # some real WebDAV clients too. id:9000024/9000025 above (requestBodyAccess
+    # and the aggregate-score threshold) do not help here: both 920170/920340
+    # are phase:2 HEADER checks, evaluated before - and independent of -
+    # request body access, and raising the aggregate threshold did not
+    # prevent the block either (only two low-combined-severity rules matched
+    # per the audit log, well under even the raised threshold, yet it still
+    # blocked - suggests the threshold bump was not the deciding factor here
+    # at all). Removing these two rule IDs outright for PUT on both DAV
+    # endpoints, same mechanism as the 921110/PROPFIND fix above
+    # (id:9000022), is the direct, verified-pattern fix - not a body or score
+    # tuning knob that turned out not to apply here.
+    if [[ -f "$excl" ]] && ! grep -q 'id:9000026,' "$excl"; then
+        cat >> "$excl" <<'EOF'
+
+# grommunio-files WebDAV (webdav + dav endpoints) PUT uploads: remove rules
+# 920170 and 920340 outright - found 2026-11-14, every WebDAV PUT upload was
+# blocked (400). 920170 fired despite its own chain requiring REQUEST_METHOD
+# to be GET/HEAD (confirmed by reading the real CRS rule source) - a genuine
+# method-detection bug in this ModSecurity/connector combination, not
+# something fixable here except by excluding it. 920340 (missing
+# Content-Type on a body-bearing request) is a real but low-severity
+# (NOTICE) match for this upload style. Method-scoped via chain so other
+# verbs on these paths keep both rules active.
+SecRule REQUEST_METHOD "@streq PUT" \
+    "id:9000026,\
+    phase:1,\
+    pass,\
+    nolog,\
+    chain"
+    SecRule REQUEST_URI "@beginsWith /files/remote.php/webdav" \
+        "ctl:ruleRemoveById=920170,\
+        ctl:ruleRemoveById=920340"
+SecRule REQUEST_METHOD "@streq PUT" \
+    "id:9000027,\
+    phase:1,\
+    pass,\
+    nolog,\
+    chain"
+    SecRule REQUEST_URI "@beginsWith /files/remote.php/dav" \
+        "ctl:ruleRemoveById=920170,\
+        ctl:ruleRemoveById=920340"
+EOF
+        log "Added the WebDAV (webdav+dav) PUT rule-920170/920340 exclusion to $excl."
+    else
+        log "[ OK ] WebDAV (webdav+dav) PUT rule-920170/920340 exclusion already present in $excl (or file missing)."
+    fi
     finalize_backup "$excl"
 
     mkdir -p /etc/nginx/modsec
