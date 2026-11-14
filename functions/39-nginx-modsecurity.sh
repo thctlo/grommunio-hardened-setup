@@ -646,9 +646,19 @@ EOF
     # fragile text pattern) before the real exclusion below is written.
     if [[ -f "$excl" ]] && grep -q 'SecRule REQUEST_METHOD "@streq PUT"' "$excl" && grep -q 'id:9000026,' "$excl"; then
         local stale_start stale_end
-        stale_start="$(grep -n '# grommunio-files WebDAV (webdav + dav endpoints) PUT uploads: remove rules' "$excl" | head -n1 | cut -d: -f1)"
+        # Both greps below can legitimately find nothing - once this
+        # migration has already run once, the stale comment text is gone
+        # (the outer `if` above matches on substrings that also appear in
+        # OTHER, still-wanted exclusions like id:9000020/9000024, so it
+        # keeps re-checking every run, not just the first). `grep -n` on no
+        # match exits 1, which would otherwise abort this script under
+        # set -e pipefail even inside this local-variable assignment -
+        # found live 2026-11-14, the exact same class of bug already fixed
+        # once in 34-postfix-tls.sh. `|| true` makes "not found" a normal,
+        # silent no-op here, same as it should have been from the start.
+        stale_start="$(grep -n '# grommunio-files WebDAV (webdav + dav endpoints) PUT uploads: remove rules' "$excl" | head -n1 | cut -d: -f1 || true)"
         if [[ -n "$stale_start" ]]; then
-            stale_end="$(tail -n "+$stale_start" "$excl" | grep -n '^        ctl:ruleRemoveById=920340"$' | sed -n '2p' | cut -d: -f1)"
+            stale_end="$(tail -n "+$stale_start" "$excl" | grep -n '^        ctl:ruleRemoveById=920340"$' | sed -n '2p' | cut -d: -f1 || true)"
             if [[ -n "$stale_end" ]]; then
                 stale_end=$((stale_start + stale_end - 1))
                 sed -i "${stale_start},${stale_end}d" "$excl"
