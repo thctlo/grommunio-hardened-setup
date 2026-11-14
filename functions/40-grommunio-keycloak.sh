@@ -523,22 +523,6 @@ echo "============================================================"
 echo " Done — CLI-level verification complete"
 echo "============================================================"
 echo
-echo "Still needs a human (cannot be automated over SSH):"
-echo
-echo "  1. Open https://${FQDN}/web/ in a private browser window."
-echo "  2. Confirm it redirects to the Keycloak login page within a few seconds."
-echo "  3. Log in with real grommunio credentials, confirm the mailbox opens."
-echo "  4. Send a test message to confirm MAPI works through the token."
-echo "  5. Log out, revisit /web/, confirm it asks to log in again (a fresh"
-echo "     login after this step also picks up the audience-mapper fix above,"
-echo "     if it was just created)."
-echo "  6. Optionally enroll MFA for a test user (realm 'grommunio' -> Users ->"
-echo "     Details -> Required user actions -> Configure OTP) and confirm the"
-echo "     QR code / TOTP prompt appears on next login. Admin console login is"
-echo "     the SAME admin password grommunio-setup already gave you."
-echo "  7. Watch token refresh: journalctl -u gromox-zcore -f (guide says"
-echo "     refresh happens roughly every 280s and should not force a re-login)."
-echo
 
     # Chat (step 34) sets up its Keycloak SSO here if chat was installed before Keycloak.
     if dpkg -s grommunio-chat-v10 >/dev/null 2>&1 && [[ -n "$SHARED_ADMIN_PASSWORD" ]]; then
