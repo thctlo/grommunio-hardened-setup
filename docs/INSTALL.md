@@ -334,12 +334,18 @@ grommunio's **community package repository**
 skipped, regardless of which option you pick below. The choice is
 only about whether a *second* source gets layered on top of it:
 
-1. **Community only** (option 2) - just the above, nothing else.
-2. **Community + your own rebuilt packages** (option 1, default) -
+1. **Community only** (option 1, default) - just the above, nothing
+   else. The right choice unless you specifically have your own
+   rebuilt package pool to layer on top - option 2's local file repo
+   does not exist on a fresh server.
+2. **Community + your own rebuilt packages** (option 2) -
    additionally registers a local, file-based repo (a package pool
    you've copied onto this server yourself) and pins it *above*
-   community via APT preferences (`Pin: origin ""`, priority 900 -
-   the standard way to prefer a local archive). This is selective and
+   community via APT preferences (`Pin: release o=personal-build`,
+   priority 900 - matching a unique `Origin:` this repo's own
+   generated `Release` file sets, not a bare "local source" match,
+   which turned out to also match Debian's own base/backports sources
+   when configured via a `mirror+file://` URI). This is selective and
    automatic: whatever package names actually exist in your local
    pool resolve from there; every other package - `grommunio-setup`,
    `grommunio-chat-v10`, `grommunio-auth`, everything - still resolves
@@ -352,11 +358,11 @@ only about whether a *second* source gets layered on top of it:
    which is itself a reason to keep it refreshed).
 
 **Why:** this is the one step with a real choice in it - see the box
-below for when option 1 is actually useful.
+below for when option 2 is actually useful.
 
 **Result:** `apt-cache policy grommunio-setup` shows a candidate
 version coming from `download.grommunio.com` either way; if using
-option 1, `apt-cache policy <your-package>` shows its candidate coming
+option 2, `apt-cache policy <your-package>` shows its candidate coming
 from `file://<your repo dir>` instead, at priority 900 in the version
 table; `apt-get update` runs without errors.
 
@@ -364,9 +370,9 @@ table; `apt-get update` runs without errors.
 > packages in this stack are maintained as separate, independent
 > rebuilds rather than taken from the community repo as-is. This is
 > **entirely optional** and not needed for a working install - choose
-> option 2 above and skip straight to Step 30 unless you specifically
+> option 1 above and skip straight to Step 30 unless you specifically
 > want this. See [`custom-repo/README.md`](custom-repo/README.md) for
-> how to set up the local pool option 1 expects. A couple of these are
+> how to set up the local pool option 2 expects. A couple of these are
 > kept private - personal, modified-for-own-use builds, not part of
 > this public path at all (see that page's own note).
 

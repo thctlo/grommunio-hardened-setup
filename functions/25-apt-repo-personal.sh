@@ -4,9 +4,20 @@
 #
 # Chooses where the grommunio/gromox packages come from:
 #
-#   1) Personal build packages + community (default). The community
-#      repo (see option 2) is ALWAYS configured as the baseline - this
-#      option then additionally layers a LOCAL, file-based copy of the
+#   1) grommunio community packages only (default), as documented by
+#      grommunio: suite Debian_13 at
+#      download.grommunio.com/community/Debian_13, signed with the
+#      grommunio key. Only the apt source and the key are installed;
+#      the community setup script and the licence file are not used.
+#      This is the right choice for anyone following this project's
+#      own install docs on a server that is not Louis's own build
+#      host - option 2's local file repo only exists there. Choosing
+#      this explicitly disables any existing personal-repo overlay
+#      (moved aside, not deleted) - option 2 is what re-enables it.
+#
+#   2) Personal build packages + community. The community repo (see
+#      option 1) is ALWAYS configured as the baseline - this option
+#      then additionally layers a LOCAL, file-based copy of the
 #      admin's own rebuilt package pool on top of it, via APT pinning,
 #      so only the specific packages that pool actually contains ever
 #      come from it; everything else (grommunio-setup, grommunio-chat-v10,
@@ -16,7 +27,7 @@
 #      server (manually, e.g. via scp from the build host's
 #      /srv/apt-repo/pool, which is outside this script's scope) into
 #      REPO_DIR. This step then:
-#        a. configures the community repo (see option 2), if not already done
+#        a. configures the community repo (see option 1), if not already done
 #        b. verifies REPO_DIR exists and contains .deb files
 #        c. generates Packages(.gz) and a minimal Release file (with a
 #           unique Origin: this repo, and only this repo, ever sets)
@@ -38,14 +49,6 @@
 #        f. apt-get update, then verifies grommunio-setup still
 #           resolves from community AND at least one package from
 #           REPO_DIR resolves from the local repo
-#
-#   2) grommunio community packages only, as documented by grommunio:
-#      suite Debian_13 at download.grommunio.com/community/Debian_13,
-#      signed with the grommunio key. Only the apt source and the key
-#      are installed; the community setup script and the licence file
-#      are not used. Choosing this explicitly disables any existing
-#      personal-repo overlay (moved aside, not deleted) - option 1 is
-#      what re-enables it.
 #
 # Must run before functions/30-grommunio-setup.sh.
 
@@ -119,20 +122,20 @@ else
     echo " Package source for grommunio"
     echo "============================================================"
     echo
-    echo "  1) Community packages + personal build packages on top (local file repo, copied from the build host)"
-    echo "  2) grommunio community packages only (download.grommunio.com)"
+    echo "  1) grommunio community packages only (download.grommunio.com)"
+    echo "  2) Community packages + personal build packages on top (local file repo, copied from the build host)"
     echo
     read -r -p "Choose [1/2] [1]: " PKG_CHOICE
     case "${PKG_CHOICE:-1}" in
-        1) PKG_SOURCE="personal" ;;
-        2) PKG_SOURCE="community" ;;
+        1) PKG_SOURCE="community" ;;
+        2) PKG_SOURCE="personal" ;;
         *) err "Invalid choice: $PKG_CHOICE"; return 1 ;;
     esac
 fi
 
 # ============================================================
-# Community repo baseline - used by both options (option 1 layers the
-# personal repo on top of this; option 2 stops here).
+# Community repo baseline - used by both options (option 2 layers the
+# personal repo on top of this; option 1 stops here).
 # ============================================================
 
 configure_community_baseline()
@@ -167,7 +170,7 @@ EOF
 }
 
 # ============================================================
-# Option 2: grommunio community packages only
+# Option 1: grommunio community packages only
 # ============================================================
 
 configure_community()
@@ -208,7 +211,7 @@ configure_community()
 }
 
 # ============================================================
-# Option 1: community baseline + personal build packages on top
+# Option 2: community baseline + personal build packages on top
 # (file-based flat repo, pinned above community for whatever it
 # actually contains - everything else still resolves from community)
 # ============================================================

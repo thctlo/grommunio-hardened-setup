@@ -61,22 +61,24 @@ server.)
 Then, on the mail server itself, copy the resulting pool of `.deb`
 files anywhere (e.g. `scp -r` from the build host's
 `/srv/apt-repo/pool`) and run **Step 25**
-(`functions/25-apt-repo-personal.sh`) choosing **option 1** - pointing
+(`functions/25-apt-repo-personal.sh`) choosing **option 2** - pointing
 it at that directory when asked. That one step does everything else:
 generates the package index, adds the local repo as a second apt
 source, and writes an APT preferences file pinning it above community
-(`Pin: origin ""`, priority 900 - the standard way to prefer a local
-archive, matching no hostname so it can never accidentally also match
-community's own HTTPS source). Priority, not version number, decides
-the winner: a package present in both resolves from your local pool
-even if community's copy has a higher version number - intentional,
-since your own pool is a manual copy that can otherwise go stale
-unnoticed, but it also means you should refresh the pool (re-copy the
-`.deb`s, re-run Step 25) when you actually want a newer upstream
-version for one of these packages specifically. The step verifies both
-halves worked before finishing: `grommunio-setup`'s candidate still
-comes from community, and at least one of your own pool's packages
-resolves from the local repo instead.
+(`Pin: release o=personal-build`, priority 900 - matching a unique
+`Origin:` this repo's own generated `Release` file sets, not a bare
+"local source" match, which turned out to also match Debian's own
+base/backports sources when configured via a `mirror+file://` URI).
+Priority, not version number, decides the winner: a package present
+in both resolves from your local pool even if community's copy has a
+higher version number - intentional, since your own pool is a manual
+copy that can otherwise go stale unnoticed, but it also means you
+should refresh the pool (re-copy the `.deb`s, re-run Step 25) when you
+actually want a newer upstream version for one of these packages
+specifically. The step verifies both halves worked before finishing:
+`grommunio-setup`'s candidate still comes from community, and at
+least one of your own pool's packages resolves from the local repo
+instead.
 
 After that: `apt-get install grommunio-archive`/
 `python3-certbot-dns-transip` as normal - `apt-cache policy <package>`
