@@ -194,6 +194,40 @@ fi
 log "Note: privFiles is per-user. Grant it to any other mailbox that needs Files with:"
 log "  grommunio-admin user modify <user> --privFiles true"
 
+# REAL BUG FOUND 2026-11-14: grommunio-files' own postinst does not
+# reliably add the real public FQDN (the one end users actually type into
+# a browser) to Nextcloud's trusted_domains. Found live with a truncated,
+# garbage entry ("mail." instead of "mail.example1.eu") sitting alongside
+# a correct but DIFFERENT entry (mx1.example1.eu - this server's own
+# mail-exchange/PTR hostname, not the public web FQDN). Nextcloud rejects
+# EVERY request whose Host header is not in this list with a flat 400,
+# before auth or routing even happen - this is what made the WebDAV
+# verification below fail with no useful nginx/ModSecurity-level trace at
+# all (confirmed directly: the same request succeeds with Host: localhost
+# or Host: mx1.example1.eu, and fails identically for every method/path/
+# auth combination otherwise - never a WebDAV or WAF issue in the first
+# place). Fixed the supported way (occ, not editing config.php by hand).
+local OCC="/usr/share/grommunio-files/occ"
+local OCC_USER="grofiles"
+if [[ -x "$OCC" ]]; then
+    if sudo -u "$OCC_USER" php "$OCC" config:system:get trusted_domains 2>/dev/null | grep -qxF "$FQDN"; then
+        log "[ OK ] $FQDN already in trusted_domains."
+    else
+        local td_next=0
+        while sudo -u "$OCC_USER" php "$OCC" config:system:get trusted_domains "$td_next" >/dev/null 2>&1; do
+            td_next=$((td_next + 1))
+        done
+        sudo -u "$OCC_USER" php "$OCC" config:system:set trusted_domains "$td_next" --value="$FQDN" >/dev/null 2>&1
+        if sudo -u "$OCC_USER" php "$OCC" config:system:get trusted_domains 2>/dev/null | grep -qxF "$FQDN"; then
+            log "[ OK ] Added $FQDN to trusted_domains (index $td_next)."
+        else
+            err "[WARN] Could not add $FQDN to trusted_domains - check manually with: sudo -u $OCC_USER php $OCC config:system:get trusted_domains"
+        fi
+    fi
+else
+    err "[WARN] $OCC not found - could not verify trusted_domains."
+fi
+
 local WEB_FILES_CFG="/etc/grommunio-web/config-files.php"
 if [[ -f "$WEB_FILES_CFG" ]]; then
     if grep -q "PLUGIN_FILES_USER_DEFAULT_ENABLE'.*true" "$WEB_FILES_CFG"; then
