@@ -20,14 +20,30 @@
 # never skipped by this mechanism — that is each step's own responsibility.
 #
 # Usage:
-#   sudo ./server-setup.sh [--domain example.com] [--hostname mx1]
-#                          [--no-grommunio-setup]
+#   sudo ./server-setup.sh [--domain example.com] [--hostname mail]
+#                          [--mx-hostname mx1] [--no-grommunio-setup]
 #
 #   --domain <domain>       Pre-fills step 10's hostname/domain prompt (and,
 #                           through it, step 31's domain-to-create) - skips
 #                           being asked interactively. Combine with
 #                           --hostname for the full FQDN (<hostname>.<domain>).
-#   --hostname <name>       Same, for the hostname half.
+#   --hostname <name>       Same, for the hostname half. This is the SYSTEM
+#                           hostname - hostnamectl, and the public FQDN
+#                           every web-facing service (grommunio-web,
+#                           Keycloak, grommunio-files) uses. Checked
+#                           against this domain's own A/AAAA record, never
+#                           against PTR.
+#   --mx-hostname <name>    Postfix's OWN identity (myhostname/HELO) only -
+#                           never used for anything web-facing. Checked
+#                           against PTR instead (it is meant to match the
+#                           server's reverse DNS). Only needed when the
+#                           system hostname above would otherwise collide
+#                           with this server's own PTR name (see step 10 and
+#                           31's own "dedicated MX hostname" explanation) -
+#                           if omitted, step 10 still suggests one from PTR
+#                           automatically when it differs from --hostname,
+#                           but only for Postfix, never for the system
+#                           hostname itself.
 #   --no-grommunio-setup    Stop BEFORE step 30 (the grommunio-setup
 #                           wizard) instead of running it - for running
 #                           that wizard by hand (interactively, or because
@@ -51,6 +67,7 @@ FUNCTIONS_DIR="${SCRIPT_DIR}/functions"
 
 CLI_DOMAIN=""
 CLI_HOSTNAME=""
+CLI_MX_HOSTNAME=""
 CLI_NO_GROMMUNIO_SETUP=0
 
 while [[ $# -gt 0 ]]; do
@@ -63,10 +80,14 @@ while [[ $# -gt 0 ]]; do
             CLI_HOSTNAME="${2:?--hostname needs a value}"; shift 2 ;;
         --hostname=*)
             CLI_HOSTNAME="${1#*=}"; shift ;;
+        --mx-hostname)
+            CLI_MX_HOSTNAME="${2:?--mx-hostname needs a value}"; shift 2 ;;
+        --mx-hostname=*)
+            CLI_MX_HOSTNAME="${1#*=}"; shift ;;
         --no-grommunio-setup)
             CLI_NO_GROMMUNIO_SETUP=1; shift ;;
         -h|--help)
-            sed -n '3,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '3,56p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *)
             echo "server-setup.sh: unknown argument: $1 (see --help)" >&2
@@ -131,9 +152,9 @@ log "Backups of any file changed by this run will be written under: ${BACKUP_ROO
 # config already existed, since neither flag speaks to IP selection.
 # ============================================================
 
-if [[ -n "$CLI_DOMAIN" || -n "$CLI_HOSTNAME" ]]; then
+if [[ -n "$CLI_DOMAIN" || -n "$CLI_HOSTNAME" || -n "$CLI_MX_HOSTNAME" ]]; then
     NET_CFG="$(cfg_file 10-network-hostname)"
-    NEW_HOSTNAME="" NEW_DOMAIN="" NEW_FQDN="" PRIMARY_IPV4="" PRIMARY_IPV6=""
+    NEW_HOSTNAME="" NEW_DOMAIN="" NEW_FQDN="" PRIMARY_IPV4="" PRIMARY_IPV6="" MX_HOSTNAME="" NEW_MX_FQDN=""
     if [[ -f "$NET_CFG" ]]; then
         # shellcheck disable=SC1090
         source "$NET_CFG"
@@ -142,13 +163,23 @@ if [[ -n "$CLI_DOMAIN" || -n "$CLI_HOSTNAME" ]]; then
     [[ -n "$CLI_DOMAIN" ]] && NEW_DOMAIN="$CLI_DOMAIN"
     [[ -z "$NEW_HOSTNAME" ]] && die "--domain given without --hostname (and no hostname saved from an earlier run) - step 10 needs both to build the FQDN."
     NEW_FQDN="${NEW_HOSTNAME}${NEW_DOMAIN:+.$NEW_DOMAIN}"
+    # --mx-hostname is Postfix's own identity only, never the system
+    # hostname above - see this script's own --help for why. Built against
+    # the SAME domain as --hostname/--domain, same as the system FQDN.
+    if [[ -n "$CLI_MX_HOSTNAME" ]]; then
+        MX_HOSTNAME="$CLI_MX_HOSTNAME"
+        NEW_MX_FQDN="${MX_HOSTNAME}${NEW_DOMAIN:+.$NEW_DOMAIN}"
+    fi
     save_cfg "$NET_CFG" \
         "NEW_HOSTNAME=$NEW_HOSTNAME" \
         "NEW_DOMAIN=$NEW_DOMAIN" \
         "NEW_FQDN=$NEW_FQDN" \
         "PRIMARY_IPV4=$PRIMARY_IPV4" \
-        "PRIMARY_IPV6=$PRIMARY_IPV6"
+        "PRIMARY_IPV6=$PRIMARY_IPV6" \
+        "MX_HOSTNAME=$MX_HOSTNAME" \
+        "NEW_MX_FQDN=$NEW_MX_FQDN"
     log "Pre-seeded hostname/domain from --domain/--hostname: $NEW_FQDN (step 10 will still ask to confirm applying the network config itself)."
+    [[ -n "$NEW_MX_FQDN" ]] && log "Pre-seeded Postfix's own mx-hostname from --mx-hostname: $NEW_MX_FQDN (system hostname stays $NEW_FQDN)."
 fi
 
 # ============================================================

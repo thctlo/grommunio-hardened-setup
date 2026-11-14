@@ -181,6 +181,33 @@ else
     log "Appended reject_unknown_helo_hostname to smtpd_helo_restrictions (was: '$CUR_HELO_RESTRICTIONS')."
 fi
 
+# myhostname override: Postfix's OWN identity (HELO/EHLO, SASL domain,
+# banner) - only set explicitly when step 10 determined a SEPARATE
+# mx-hostname (NEW_MX_FQDN, found via PTR or --mx-hostname), which must
+# never be conflated with the system/web hostname grommunio-web/Keycloak/
+# grommunio-files use (see step 10's own header comment on MX_HOSTNAME
+# for the real bug this prevents - found live 2026-11-14/15). Without a
+# separate mx-hostname, Postfix keeps using its own default (the system
+# hostname) - no override needed or written.
+local NET_CFG_FOR_MX="$(cfg_file 10-network-hostname)"
+local NEW_MX_FQDN=""
+if [[ -f "$NET_CFG_FOR_MX" ]]; then
+    # shellcheck disable=SC1090
+    source "$NET_CFG_FOR_MX"
+fi
+if [[ -n "$NEW_MX_FQDN" ]]; then
+    if [[ "$(postconf -h myhostname)" == "$NEW_MX_FQDN" ]]; then
+        log "[ OK ] myhostname already set to the dedicated mx-hostname ($NEW_MX_FQDN)."
+    else
+        [[ "$changed" -eq 1 ]] || backup_file "$MAIN_CF"
+        postconf -e "myhostname = ${NEW_MX_FQDN}"
+        changed=1
+        log "Set myhostname = $NEW_MX_FQDN (Postfix's own dedicated mx-hostname, found via PTR or --mx-hostname - the system/web hostname is unaffected)."
+    fi
+else
+    log "[ OK ] No dedicated mx-hostname from step 10 - myhostname stays Postfix's own default (this server's system hostname)."
+fi
+
 finalize_backup "$MAIN_CF"
 if [[ "$changed" -eq 1 ]]; then
     postfix check || die "postfix check failed after the hardening changes - restore from the .bak file just written."

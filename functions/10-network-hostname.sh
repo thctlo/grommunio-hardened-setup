@@ -56,6 +56,19 @@ local NEW_HOSTNAME=""
 local NEW_DOMAIN=""
 local NEW_FQDN=""
 
+# MX_HOSTNAME/NEW_MX_FQDN: Postfix's OWN identity (myhostname/HELO) only -
+# never used for anything web-facing (grommunio-web, Keycloak,
+# grommunio-files, hostnamectl). Decoupled from NEW_HOSTNAME/NEW_FQDN
+# deliberately: those two used to be the same single value, PTR-suggested
+# by default, which repeatedly leaked this server's own mail-exchange
+# identity into web-facing config that should have used the public
+# hostname instead (found live 2026-11-14/15 - Keycloak's issuer,
+# grommunio-files' trusted_domains, both ended up as this server's PTR
+# name instead of the FQDN users actually connect through). See step 34's
+# postfix-hardening step for where this actually gets applied to main.cf.
+local MX_HOSTNAME=""
+local NEW_MX_FQDN=""
+
 local PRIMARY_IPV4=""
 local PRIMARY_IPV6=""
 
@@ -67,6 +80,7 @@ local CFG="$(cfg_file 10-network-hostname)"
 local USING_SAVED_CFG=0
 local SAVED_NEW_HOSTNAME="" SAVED_NEW_DOMAIN="" SAVED_NEW_FQDN=""
 local SAVED_PRIMARY_IPV4="" SAVED_PRIMARY_IPV6=""
+local SAVED_MX_HOSTNAME="" SAVED_NEW_MX_FQDN=""
 
 # ============================================================
 # Required commands
@@ -494,8 +508,10 @@ if [[ -f "$CFG" ]]; then
     SAVED_NEW_FQDN="${NEW_FQDN:-}"
     SAVED_PRIMARY_IPV4="${PRIMARY_IPV4:-}"
     SAVED_PRIMARY_IPV6="${PRIMARY_IPV6:-}"
+    SAVED_MX_HOSTNAME="${MX_HOSTNAME:-}"
+    SAVED_NEW_MX_FQDN="${NEW_MX_FQDN:-}"
     # Clear so we don't confuse "loaded" with "computed below" while deciding.
-    NEW_HOSTNAME=""; NEW_DOMAIN=""; NEW_FQDN=""; PRIMARY_IPV4=""; PRIMARY_IPV6=""
+    NEW_HOSTNAME=""; NEW_DOMAIN=""; NEW_FQDN=""; PRIMARY_IPV4=""; PRIMARY_IPV6=""; MX_HOSTNAME=""; NEW_MX_FQDN=""
     if [[ -n "$SAVED_NEW_HOSTNAME" ]]; then
         USING_SAVED_CFG=1
         log "Found saved configuration: $CFG"
@@ -519,10 +535,12 @@ else
     echo " Hostname and domain"
     echo "============================================================"
     echo
-    local PROMPT_DEFAULT_HOSTNAME="${PTR_SUGGESTED_FQDN:-$CURRENT_HOSTNAME}"
-    if [[ -n "$PTR_SUGGESTED_FQDN" ]]; then
-        log "Suggesting the FQDN found via PTR (reverse DNS): $PTR_SUGGESTED_FQDN"
-    fi
+    # Deliberately NOT defaulted to the PTR-suggested name - that name is
+    # Postfix's own identity, not necessarily this server's public/web
+    # hostname (see this file's header note on MX_HOSTNAME for why those
+    # two must never be silently conflated). The PTR name is still offered
+    # below, but only for Postfix's own mx-hostname.
+    local PROMPT_DEFAULT_HOSTNAME="$CURRENT_HOSTNAME"
     read -r -p "Hostname or FQDN [${PROMPT_DEFAULT_HOSTNAME}]: " NEW_HOSTNAME
     NEW_HOSTNAME="${NEW_HOSTNAME:-$PROMPT_DEFAULT_HOSTNAME}"
 
@@ -562,6 +580,62 @@ else
     read -r -p "Is this correct? [y/N]: " CONFIRM_HOST
     if [[ ! "$CONFIRM_HOST" =~ ^[Yy]$ ]]; then
         echo; echo "Hostname/domain configuration rejected."; return 0
+    fi
+fi
+
+# ============================================================
+# Postfix's own identity (myhostname/HELO) - deliberately separate from
+# NEW_HOSTNAME/NEW_FQDN above (the system/web-facing hostname). An
+# explicitly given value (--mx-hostname, or saved from an earlier run)
+# always wins. Otherwise, auto-suggest the PTR name for POSTFIX ONLY,
+# when it actually differs from the system FQDN - this server's own
+# reverse DNS is exactly what Postfix's identity should match, but it
+# must never be silently reused as the public/web hostname too (that
+# conflation is what caused real bugs elsewhere in this project -
+# Keycloak's issuer and grommunio-files' trusted_domains both ended up
+# as this server's PTR name instead of the FQDN users actually connect
+# through, found live 2026-11-14/15). Applied to main.cf by step 34
+# (postfix-hardening), not here - this step only decides the value.
+# ============================================================
+if [[ -n "$SAVED_MX_HOSTNAME" || -n "$SAVED_NEW_MX_FQDN" ]]; then
+    MX_HOSTNAME="$SAVED_MX_HOSTNAME"
+    NEW_MX_FQDN="${SAVED_NEW_MX_FQDN:-$NEW_MX_FQDN}"
+fi
+if [[ -z "$NEW_MX_FQDN" && -n "$PTR_SUGGESTED_FQDN" && "$PTR_SUGGESTED_FQDN" != "$NEW_FQDN" ]]; then
+    NEW_MX_FQDN="$PTR_SUGGESTED_FQDN"
+    MX_HOSTNAME="${NEW_MX_FQDN%%.*}"
+    log "Postfix will use $NEW_MX_FQDN (found via PTR) as its own identity (myhostname/HELO) - the system/web hostname stays $NEW_FQDN. Override with --mx-hostname if this is wrong, or edit $CFG."
+fi
+if [[ -n "$NEW_MX_FQDN" ]]; then
+    log "Postfix mx-hostname : $NEW_MX_FQDN (system/web hostname stays $NEW_FQDN)"
+else
+    log "No separate Postfix mx-hostname needed - $NEW_FQDN already matches PTR (or PTR is unknown)."
+fi
+
+# ============================================================
+# A-record check for the system/web hostname (NOT a PTR check - PTR is
+# Postfix's own concern, handled above via MX_HOSTNAME/NEW_MX_FQDN only).
+# Every web-facing service (grommunio-web, Keycloak, grommunio-files)
+# needs browsers to actually reach THIS server at $NEW_FQDN, which only
+# works if $NEW_FQDN's own A/AAAA record points here - a mismatch here
+# would silently break every one of those services the same way the
+# mx-hostname/web-hostname conflation already did once.
+# ============================================================
+if [[ -n "$NEW_DOMAIN" ]]; then
+    local fqdn_a fqdn_aaaa fqdn_a_ok=0
+    fqdn_a="$(resolvectl query "$NEW_FQDN" 2>/dev/null | awk '{print $2}')"
+    if [[ -n "$fqdn_a" ]]; then
+        for addr in "${IPV4_ADDRESSES[@]%/*}" "${IPV6_ADDRESSES[@]%/*}"; do
+            [[ -n "$addr" && "$fqdn_a" == "$addr" ]] && fqdn_a_ok=1
+        done
+    fi
+    if [[ "$fqdn_a_ok" -eq 1 ]]; then
+        log "[ OK ] $NEW_FQDN's own A/AAAA record resolves to this server ($fqdn_a)."
+    else
+        echo "WARNING: $NEW_FQDN does not (yet) resolve to this server's own address"
+        echo "(found: ${fqdn_a:-nothing}). Every web-facing service (grommunio-web,"
+        echo "Keycloak, grommunio-files) needs this to work - fix the A/AAAA record"
+        echo "for $NEW_FQDN before relying on it, if not already done."
     fi
 fi
 
@@ -1030,7 +1104,9 @@ if (( VERIFY_FAILED == 0 )); then
         "NEW_DOMAIN=$NEW_DOMAIN" \
         "NEW_FQDN=$NEW_FQDN" \
         "PRIMARY_IPV4=$PRIMARY_IPV4" \
-        "PRIMARY_IPV6=$PRIMARY_IPV6"
+        "PRIMARY_IPV6=$PRIMARY_IPV6" \
+        "MX_HOSTNAME=$MX_HOSTNAME" \
+        "NEW_MX_FQDN=$NEW_MX_FQDN"
     log "Saved configuration for replay: $CFG"
 else
     echo " Network migration completed with WARNINGS/ERRORS"
