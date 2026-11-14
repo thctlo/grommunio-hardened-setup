@@ -129,6 +129,25 @@ else
     log "No saved SSH whitelist from step 20 — leaving allow-from-networks at its own default (0.0.0.0/0 ::/0). Fix later with: debconf-set-selections + dpkg-reconfigure grommunio-keycloak."
 fi
 
+# REAL BUG FOUND 2026-11-14: unlike 34-grommunio-chat.sh and
+# 45-grommunio-files.sh (which both explicitly preseed this same shared
+# template themselves before installing), this step never preseeded
+# shared/grommunio/site-fqdn at all - both grommunio-auth.config and
+# grommunio-keycloak.config reference it (confirmed by reading the real
+# postinst/.config scripts, not guessed). Without it, Keycloak ended up
+# issuing tokens as this SERVER's own system hostname (mx1.example1.eu,
+# this server's mail-exchange/PTR identity - set in step 10 for Postfix/
+# DANE, never meant for anything web-facing) instead of the public FQDN
+# users actually connect through - confirmed live via the discovery
+# endpoint's own "issuer" field. Keycloak must use the public FQDN
+# ($FQDN, e.g. mail.<domain>) for its issuer/redirect URIs - mx1 is a
+# Postfix/certificate-only identity, never a Keycloak one. Preseeded
+# under both owner names, same pattern as the admin-password preseed
+# below.
+debconf-set-selections <<< "grommunio-auth shared/grommunio/site-fqdn string ${FQDN}"
+debconf-set-selections <<< "grommunio-keycloak shared/grommunio/site-fqdn string ${FQDN}"
+log "Preseeded shared/grommunio/site-fqdn = ${FQDN} for grommunio-auth and grommunio-keycloak."
+
 # ============================================================
 # The admin password drives realm creation: grommunio-auth's configure_auth
 # returns silently when shared/grommunio/admin-password is empty, so no
