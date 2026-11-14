@@ -388,22 +388,43 @@ unset TEST_PASSWORD
 # ============================================================
 # REAL BUG FOUND 2026-10-29, in the package itself (not ours):
 # /usr/lib/systemd/system/grommunio-files-cron.timer (which its own
-# description calls "Run Nextcloud cron.php every 5 minutes") only has
+# description calls "Run Nextcloud cron.php every 5 minutes") only had
 # `OnBootSec=120` in its [Timer] section - no `OnUnitActiveSec=` or
 # `OnCalendar=` to make it repeat. Confirmed live: it ran exactly once,
 # 120s after boot on 2026-10-25, and never again since (`systemctl
 # list-timers` showed "NEXT: -", no scheduled run, 3 days of inactivity).
 # Nextcloud's own documentation requires cron.php every 5 minutes for
 # background jobs (trash/versions cleanup, file scanning, federated
-# sharing, notifications) - none of that has been running at all.
-# Fixed via a drop-in (not editing the package file directly), adding
-# the missing repeat interval while leaving OnBootSec alone. Idempotent:
-# only writes/reloads if the drop-in doesn't already match.
+# sharing, notifications).
+#
+# Fixed upstream since: confirmed live 2026-11-14 on grommunio-files
+# 34.0.4-1 - the package's OWN shipped unit now has OnUnitActiveSec=5min
+# natively (flagged by the operator: "mogelijk is deze niet meer nodig?" -
+# checked, and yes). Checking the PACKAGE's own file directly (not
+# `systemctl cat`, which would show OUR drop-in's directive too and
+# mask whether the package itself still needs it) rather than assuming
+# either way, so this step stays correct on an older package that still
+# has the original bug AND on this fixed version, without ever creating
+# a redundant duplicate drop-in. Removes a drop-in from an earlier run
+# once it is no longer needed, instead of leaving dead config behind.
 # ============================================================
+FILES_CRON_PKG_UNIT="/usr/lib/systemd/system/grommunio-files-cron.timer"
 FILES_CRON_DROPIN_DIR="/etc/systemd/system/grommunio-files-cron.timer.d"
 FILES_CRON_DROPIN="$FILES_CRON_DROPIN_DIR/override.conf"
-FILES_CRON_DROPIN_NEW="$(mktemp)"
-cat > "$FILES_CRON_DROPIN_NEW" <<'DROPIN'
+if grep -qE '^(OnUnitActiveSec=|OnCalendar=)' "$FILES_CRON_PKG_UNIT" 2>/dev/null; then
+    log "[ OK ] grommunio-files-cron.timer's own package unit already repeats on its own (grommunio-files >= 34.0.4-1) - no drop-in needed."
+    if [[ -f "$FILES_CRON_DROPIN" ]]; then
+        backup_file "$FILES_CRON_DROPIN"
+        rm -f "$FILES_CRON_DROPIN"
+        finalize_backup "$FILES_CRON_DROPIN"
+        systemctl daemon-reload
+        systemctl restart grommunio-files-cron.timer || die "Could not restart grommunio-files-cron.timer after removing the now-redundant drop-in."
+        log "[ OK ] Removed the now-redundant drop-in from an earlier run."
+    fi
+else
+    local FILES_CRON_DROPIN_NEW
+    FILES_CRON_DROPIN_NEW="$(mktemp)"
+    cat > "$FILES_CRON_DROPIN_NEW" <<'DROPIN'
 # Managed by 45-grommunio-files.sh. The package's own timer
 # (grommunio-files-cron.timer) only has OnBootSec=120 - it fires once at
 # boot and never repeats, despite its own description saying "every 5
@@ -412,20 +433,27 @@ cat > "$FILES_CRON_DROPIN_NEW" <<'DROPIN'
 [Timer]
 OnUnitActiveSec=5min
 DROPIN
-install -d "$FILES_CRON_DROPIN_DIR"
-if ! cmp -s "$FILES_CRON_DROPIN_NEW" "$FILES_CRON_DROPIN" 2>/dev/null; then
-    backup_file "$FILES_CRON_DROPIN"
-    install -m 0644 "$FILES_CRON_DROPIN_NEW" "$FILES_CRON_DROPIN"
-    finalize_backup "$FILES_CRON_DROPIN"
-    systemctl daemon-reload
-    systemctl restart grommunio-files-cron.timer || die "Could not restart grommunio-files-cron.timer after fixing its interval."
-    log "[ OK ] grommunio-files-cron.timer: added the missing 5-minute repeat interval."
-else
-    log "[ OK ] grommunio-files-cron.timer: 5-minute repeat interval already set."
+    install -d "$FILES_CRON_DROPIN_DIR"
+    if ! cmp -s "$FILES_CRON_DROPIN_NEW" "$FILES_CRON_DROPIN" 2>/dev/null; then
+        backup_file "$FILES_CRON_DROPIN"
+        install -m 0644 "$FILES_CRON_DROPIN_NEW" "$FILES_CRON_DROPIN"
+        finalize_backup "$FILES_CRON_DROPIN"
+        systemctl daemon-reload
+        systemctl restart grommunio-files-cron.timer || die "Could not restart grommunio-files-cron.timer after fixing its interval."
+        log "[ OK ] grommunio-files-cron.timer: added the missing 5-minute repeat interval."
+    else
+        log "[ OK ] grommunio-files-cron.timer: 5-minute repeat interval already set."
+    fi
+    rm -f "$FILES_CRON_DROPIN_NEW"
 fi
-rm -f "$FILES_CRON_DROPIN_NEW"
-if [[ -z "$(systemctl show grommunio-files-cron.timer -p NextElapseUSecRealtime --value)" ]]; then
-    die "grommunio-files-cron.timer still shows no scheduled next run after the fix - check the drop-in."
+# OnUnitActiveSec/OnBootSec are monotonic (CLOCK_MONOTONIC) timers, not
+# calendar ones - NextElapseUSecRealtime is only ever populated by an
+# OnCalendar= directive and is structurally always empty here. Checking
+# it was the actual bug behind this script's own "still shows no
+# scheduled next run" false failure, found live 2026-11-14 - the timer
+# was working correctly the whole time. Checking Monotonic instead.
+if [[ -z "$(systemctl show grommunio-files-cron.timer -p NextElapseUSecMonotonic --value)" ]]; then
+    die "grommunio-files-cron.timer still shows no scheduled next run - check the drop-in and the package's own unit."
 else
     log "[ OK ] grommunio-files-cron.timer now has a scheduled next run."
 fi
