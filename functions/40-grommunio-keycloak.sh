@@ -485,23 +485,31 @@ else
                 # Files SSO: the Files "add account" with grommunio login sends a
                 # token from this (webmail) login to WebDAV. That token must also
                 # carry the grommunio-files audience, or Files answers "the audience
-                # does not match the client ID".
-                local files_mapper_count
-                files_mapper_count="$("$KCADM" get "clients/${CLIENT_UUID}/protocol-mappers/models" -r grommunio 2>/dev/null | grep -c 'grommunio-files-audience' || true)"
-                if [[ "${files_mapper_count:-0}" -gt 0 ]]; then
-                    log "[ OK ] Files audience mapper already exists on '$client_id'."
+                # does not match the client ID". Only relevant if grommunio-files is
+                # actually installed - this used to run unconditionally, creating an
+                # orphaned mapper (referencing a client that does not exist) when
+                # Files was never installed, found live 2026-11-14.
+                if ! dpkg -s grommunio-files >/dev/null 2>&1; then
+                    log "grommunio-files is not installed - skipping its audience mapper."
+                    log "If you install grommunio-files later, re-run this step (40) to add it."
                 else
-                    log "Adding the Files audience mapper on '$client_id'..."
-                    local files_create_out=""
-                    if ! files_create_out="$("$KCADM" create "clients/${CLIENT_UUID}/protocol-mappers/models" -r grommunio \
-                        -s name=grommunio-files-audience -s protocol=openid-connect -s protocolMapper=oidc-audience-mapper \
-                        -s 'config."included.client.audience"=grommunio-files' -s 'config."id.token.claim"=false' \
-                        -s 'config."access.token.claim"=true' -s 'config."introspection.token.claim"=true' 2>&1)"; then
-                        die "Creating the Files audience mapper failed. kcadm said: $files_create_out"
-                    fi
+                    local files_mapper_count
                     files_mapper_count="$("$KCADM" get "clients/${CLIENT_UUID}/protocol-mappers/models" -r grommunio 2>/dev/null | grep -c 'grommunio-files-audience' || true)"
-                    [[ "${files_mapper_count:-0}" -gt 0 ]] || die "Files audience mapper was reported created but is not listed on '$client_id'."
-                    log "[ OK ] Files audience mapper verified on '$client_id'."
+                    if [[ "${files_mapper_count:-0}" -gt 0 ]]; then
+                        log "[ OK ] Files audience mapper already exists on '$client_id'."
+                    else
+                        log "Adding the Files audience mapper on '$client_id'..."
+                        local files_create_out=""
+                        if ! files_create_out="$("$KCADM" create "clients/${CLIENT_UUID}/protocol-mappers/models" -r grommunio \
+                            -s name=grommunio-files-audience -s protocol=openid-connect -s protocolMapper=oidc-audience-mapper \
+                            -s 'config."included.client.audience"=grommunio-files' -s 'config."id.token.claim"=false' \
+                            -s 'config."access.token.claim"=true' -s 'config."introspection.token.claim"=true' 2>&1)"; then
+                            die "Creating the Files audience mapper failed. kcadm said: $files_create_out"
+                        fi
+                        files_mapper_count="$("$KCADM" get "clients/${CLIENT_UUID}/protocol-mappers/models" -r grommunio 2>/dev/null | grep -c 'grommunio-files-audience' || true)"
+                        [[ "${files_mapper_count:-0}" -gt 0 ]] || die "Files audience mapper was reported created but is not listed on '$client_id'."
+                        log "[ OK ] Files audience mapper verified on '$client_id'."
+                    fi
                 fi
             fi
         else
