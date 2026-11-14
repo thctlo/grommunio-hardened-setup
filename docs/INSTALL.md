@@ -159,14 +159,30 @@ step's step_<name> function in that same order, stopping on the first
 failure.
 
 Usage:
-  sudo ./server-setup.sh [--domain example.com] [--hostname mx1]
-                         [--no-grommunio-setup]
+  sudo ./server-setup.sh [--domain example.com] [--hostname mail]
+                         [--mx-hostname mx1] [--no-grommunio-setup]
 
   --domain <domain>       Pre-fills step 10's hostname/domain prompt (and,
                           through it, step 31's domain-to-create) - skips
                           being asked interactively. Combine with
                           --hostname for the full FQDN (<hostname>.<domain>).
-  --hostname <name>       Same, for the hostname half.
+  --hostname <name>       Same, for the hostname half. This is the SYSTEM
+                          hostname - hostnamectl, and the public FQDN
+                          every web-facing service (grommunio-web,
+                          Keycloak, grommunio-files) uses. Checked
+                          against this domain's own A/AAAA record, never
+                          against PTR.
+  --mx-hostname <name>    Postfix's OWN identity (myhostname/HELO) only -
+                          never used for anything web-facing. Checked
+                          against PTR instead (it is meant to match the
+                          server's reverse DNS). Only needed when the
+                          system hostname above would otherwise collide
+                          with this server's own PTR name (see step 10
+                          and 31's own "dedicated MX hostname"
+                          explanation below) - if omitted, step 10 still
+                          suggests one from PTR automatically when it
+                          differs from --hostname, but only for Postfix,
+                          never for the system hostname itself.
   --no-grommunio-setup    Stop BEFORE step 30 (the grommunio-setup
                           wizard) instead of running it - for running
                           that wizard by hand (interactively, or because
@@ -234,19 +250,33 @@ or renumbers a step in a later version).
 ### Step 10 — Network & hostname
 
 **What it does:** detects the server's own primary IPv4/IPv6 address
-and asks for (or re-derives) the FQDN this server should identify as,
-then configures that via `systemd-networkd` and sets `/etc/hostname`
-and `/etc/hosts` to match.
+and asks for (or re-derives) the FQDN this server should identify as
+(the SYSTEM hostname - `--hostname`), then configures that via
+`systemd-networkd` and sets `/etc/hostname` and `/etc/hosts` to match.
+Separately, it also determines Postfix's OWN identity
+(`--mx-hostname`), which is NOT necessarily the same name.
 
-**Why:** this hostname becomes Postfix's own identity (HELO/EHLO) and
-is checked against the PTR record you confirmed in section 2 - a
-mismatch here is one of the most common reasons outbound mail from a
-new server gets rejected or spam-flagged by other providers.
+**Why the two are different:** the system hostname is what every
+web-facing service (grommunio-web, Keycloak, grommunio-files) uses as
+its public FQDN - checked here against that name's own A/AAAA record,
+since browsers need to actually reach the server there. Postfix's own
+identity (HELO/EHLO) is a separate concern entirely, checked against
+the PTR record instead (a mismatch there is one of the most common
+reasons outbound mail gets rejected or spam-flagged). If you don't
+pass `--mx-hostname` and the PTR name differs from `--hostname`, this
+step still suggests the PTR name automatically, but only for Postfix -
+never silently reusing it as the system/web hostname too (that
+conflation caused real, confusing bugs in earlier versions of this
+project - Keycloak and grommunio-files both ended up using this
+server's mail-exchange identity instead of its public web address).
 
-**Result:** `hostnamectl` shows the FQDN you confirmed; `resolvectl
-query <that FQDN>` resolves back to this server's own IP (the same
-forward-confirmation check `check-dns.sh --firstdomain` already did in
-section 2, now re-verified against what this step actually configured).
+**Result:** `hostnamectl` shows the FQDN you confirmed (`--hostname`);
+that same name's own A/AAAA record resolves back to this server (the
+same forward-confirmation check `check-dns.sh --firstdomain` already
+did in section 2, now re-verified against what this step actually
+configured). If a separate mx-hostname was determined, `postconf -h
+myhostname` (set by step 34) shows that name instead, and its PTR
+record points back here.
 
 ---
 
