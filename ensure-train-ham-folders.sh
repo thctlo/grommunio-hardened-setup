@@ -54,8 +54,13 @@ case "${1:-}" in
     --all)
         mapfile -t users < <(grommunio-admin user query 2>/dev/null | awk '$2 ~ /@/ && $3 ~ /^0\/active/ {print $2}')
         if [[ ${#users[@]} -eq 0 ]]; then
-            echo "No active users found." >&2
-            exit 1
+            # Not an error: this is the normal state right after a fresh
+            # install, before any mailbox exists yet. The daily timer (see
+            # 38-antispam.sh) catches every user created from here on -
+            # found live 2026-11-14, this used to exit 1 and abort the
+            # whole server-setup.sh run over a perfectly expected state.
+            echo "No active users found - nothing to do yet."
+            exit 0
         fi
         failed=0
         for u in "${users[@]}"; do
