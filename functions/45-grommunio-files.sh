@@ -305,17 +305,33 @@ if grommunio-admin user create "$TEST_USER" --privFiles true --privDav true --pr
         tmpfile="$(mktemp)"
         printf '%s' "$TEST_FILE_CONTENT" > "$tmpfile"
 
-        if curl -sk -u "${TEST_USER}:${TEST_PASSWORD}" -T "$tmpfile" "$dav_url" -o /dev/null -w '%{http_code}' | grep -qE '^(200|201|204)$'; then
+        # Retried, not a single attempt: the test mailbox was created a moment
+        # ago, and this project has repeatedly found gromox-zcore/mysql_adaptor
+        # take a few seconds to recognize a brand-new username (see this
+        # file's own header comment on the privDav/zcore caching quirk, and
+        # the chat/keycloak steps' own retry loops for the same class of
+        # delay). Found live 2026-11-14: a single unretried attempt failed
+        # here with no diagnostic beyond "did not return a success status" -
+        # also fixed that, so a future failure (if this really isn't just
+        # propagation delay) shows the actual HTTP code instead of nothing.
+        local put_code="" put_attempt
+        for put_attempt in $(seq 1 10); do
+            put_code="$(curl -sk --max-time 10 -u "${TEST_USER}:${TEST_PASSWORD}" -T "$tmpfile" "$dav_url" -o /dev/null -w '%{http_code}' 2>/dev/null || true)"
+            [[ "$put_code" =~ ^(200|201|204)$ ]] && break
+            sleep 2
+        done
+
+        if [[ "$put_code" =~ ^(200|201|204)$ ]]; then
             local downloaded
-            downloaded="$(curl -sk -u "${TEST_USER}:${TEST_PASSWORD}" "$dav_url")"
+            downloaded="$(curl -sk --max-time 10 -u "${TEST_USER}:${TEST_PASSWORD}" "$dav_url" 2>/dev/null || true)"
             if [[ "$downloaded" == "$TEST_FILE_CONTENT" ]]; then
-                log "[ OK ] WebDAV PUT+GET round-trip succeeded, content matched exactly."
+                log "[ OK ] WebDAV PUT+GET round-trip succeeded, content matched exactly (attempt ${put_attempt}/10)."
             else
                 err "[FAIL] WebDAV download content did not match what was uploaded."
                 dav_verify_failed=1
             fi
         else
-            err "[FAIL] WebDAV upload did not return a success status."
+            err "[FAIL] WebDAV upload did not return a success status after ${put_attempt}/10 attempts (last HTTP code: ${put_code:-<none>})."
             dav_verify_failed=1
         fi
         rm -f "$tmpfile"
