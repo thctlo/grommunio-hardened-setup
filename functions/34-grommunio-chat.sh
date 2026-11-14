@@ -189,9 +189,17 @@ if [[ ! "${CHAT_CHOICE:-N}" =~ ^[Yy]$ ]]; then
     return 0
 fi
 
-read -r -p "Set up Keycloak SSO for chat (grommunio SSO button)? [Y/n]: " KC_CHOICE
 local WANT_KC_CLIENT=1
-[[ "${KC_CHOICE:-Y}" =~ ^[Nn]$ ]] && WANT_KC_CLIENT=0
+local CHAT_CFG_PRECHECK="/etc/grommunio-chat/config.json"
+if dpkg -s grommunio-chat-v10 >/dev/null 2>&1 && [[ -s "$CHAT_CFG_PRECHECK" ]] \
+    && [[ "$(jq -r '.GitLabSettings.Enable // ""' "$CHAT_CFG_PRECHECK" 2>/dev/null)" == "true" ]] \
+    && [[ "$(jq -r '.GitLabSettings.Scope // ""' "$CHAT_CFG_PRECHECK" 2>/dev/null)" == "profile email" ]]; then
+    log "[ OK ] Keycloak SSO for chat is already configured (GitLabSettings.Enable=true, Scope=\"profile email\" in $CHAT_CFG_PRECHECK) - not asking again."
+    WANT_KC_CLIENT=0
+else
+    read -r -p "Set up Keycloak SSO for chat (grommunio SSO button)? [Y/n]: " KC_CHOICE
+    [[ "${KC_CHOICE:-Y}" =~ ^[Nn]$ ]] && WANT_KC_CLIENT=0
+fi
 
 # The shared admin password: from this run (step 30), or asked for once.
 shared_admin_password_get "Shared grommunio admin password (same as the wizard): "
