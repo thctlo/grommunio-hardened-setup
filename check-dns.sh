@@ -629,19 +629,17 @@ cmd_report()
     [[ -n "$PRIMARY_IPV4" || -n "$PRIMARY_IPV6" ]] \
         || die "Could not determine this server's primary IPv4/IPv6 (not saved by step 10 yet, and auto-detection via 'ip route get' found nothing - check this server has a default route/network connectivity)."
 
-    # See 31-grommunio-domain.sh's hint_dedicated_mx_if_needed (same check,
-    # same reasoning): if mail.<domain> is ALSO this server's own canonical
-    # hostname (found via PTR by step 10, used by Postfix as myhostname/
-    # HELO), that name is the server's shared identity, not exclusive to
-    # this domain - so the MX target shown below becomes mx1.<domain>
-    # instead, and the DANE section explains why. If it is not this
-    # server's hostname, mail.<domain> is already exclusive to this domain
-    # and is used as the MX target directly, same as any other domain.
-    local needs_dedicated_mx=0 mx_target="$mailhost"
-    if [[ -n "${NEW_FQDN:-}" && "$NEW_FQDN" == "$mailhost" ]]; then
-        needs_dedicated_mx=1
-        mx_target="mx1.${dom}"
-    fi
+    # mail.<domain> is the baseline MX recommendation for every domain,
+    # unconditionally - no attempt here to detect whether this domain
+    # "needs" the dedicated mx1.<domain> hostname by comparing against
+    # this server's own current hostname (tried that, reverted it: it
+    # only catches the moment BEFORE a collision is resolved, not after
+    # - once a domain's PTR/HELO identity has already been moved to
+    # mx1.<domain>, as happens live, that comparison breaks and this
+    # report started recommending moving MX *back* to mail.<domain>, an
+    # actual regression. mx1 is shown unconditionally as DANE-specific
+    # advice instead, further down - simpler, and never stale.
+    local mx_target="$mailhost"
 
     # Unlike the rest of this function (a static suggestion list, since
     # --report explicitly supports a domain not hosted here yet), the MX
@@ -658,12 +656,21 @@ cmd_report()
             current_mx_status="currently: MX record found but has no target (null MX?)"
         elif [[ "$current_mx_target" == "$mx_target" ]]; then
             current_mx_status="currently: ${current_mx_target} - already set up as recommended"
+        elif [[ "$current_mx_target" == "mx1.${dom}" ]]; then
+            current_mx_status="currently: ${current_mx_target} - already using the dedicated DANE hostname (see the DANE section below), not ${mx_target}; that's fine, leave it as-is"
         else
             current_mx_status="currently: ${current_mx_target} - differs from the ${mx_target} recommended below"
         fi
     else
         current_mx_status="currently: no MX record found"
     fi
+
+    # DANE's own live status check should look at whatever this domain's
+    # MX ACTUALLY is right now (mx1.<domain> if it's already using the
+    # dedicated hostname, mail.<domain> otherwise/not set up yet) - not
+    # always the mail.<domain> baseline above, or DANE would be checked
+    # at the wrong name for a domain already using mx1.
+    local dane_check_target="${current_mx_target:-$mx_target}"
 
     # Same reasoning as the MX id above, applied to MTA-STS's "id=" field:
     # manage-mta-sts.sh does NOT generate or manage this value (its own
@@ -692,22 +699,22 @@ cmd_report()
     # public key) rather than only ever printing static setup instructions.
     local dane_cert="/etc/letsencrypt/live/${NEW_FQDN:-mail.example.com}/cert.pem"
     local dane_tlsa_out dane_tlsa_live dane_want_hash dane_status
-    if ! dane_tlsa_out="$(resolvectl query --type=TLSA "_25._tcp.${mx_target}" 2>/dev/null)"; then
-        dane_status="currently: no TLSA record at _25._tcp.${mx_target}"
+    if ! dane_tlsa_out="$(resolvectl query --type=TLSA "_25._tcp.${dane_check_target}" 2>/dev/null)"; then
+        dane_status="currently: no TLSA record at _25._tcp.${dane_check_target}"
     else
         dane_tlsa_live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$dane_tlsa_out" | head -1)"
         if [[ -z "$dane_tlsa_live" ]]; then
-            dane_status="currently: no TLSA record at _25._tcp.${mx_target}"
+            dane_status="currently: no TLSA record at _25._tcp.${dane_check_target}"
         elif [[ -f "$dane_cert" ]]; then
             dane_want_hash="$(openssl x509 -in "$dane_cert" -noout -pubkey 2>/dev/null \
                 | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.*= //')"
             if grep -qiF "$dane_want_hash" <<< "$dane_tlsa_live"; then
-                dane_status="currently: TLSA at _25._tcp.${mx_target} matches the current certificate - already set up"
+                dane_status="currently: TLSA at _25._tcp.${dane_check_target} matches the current certificate - already set up"
             else
-                dane_status="currently: TLSA at _25._tcp.${mx_target} does NOT match the current certificate - stale"
+                dane_status="currently: TLSA at _25._tcp.${dane_check_target} does NOT match the current certificate - stale"
             fi
         else
-            dane_status="currently: TLSA record found at _25._tcp.${mx_target}, could not verify it against the certificate"
+            dane_status="currently: TLSA record found at _25._tcp.${dane_check_target}, could not verify it against the certificate"
         fi
     fi
 
@@ -722,23 +729,6 @@ DNS records to set up for: ${dom}
 @                       3600    MX      10 ${mx_target}.
 mail                    3600    A       ${PRIMARY_IPV4}
 mail                    3600    AAAA    ${PRIMARY_IPV6}
-EOF
-    if [[ "$needs_dedicated_mx" -eq 1 ]]; then
-        cat <<EOF
-mx1                     3600    A       ${PRIMARY_IPV4}
-mx1                     3600    AAAA    ${PRIMARY_IPV6}
-
-NOTE: ${mailhost} is THIS SERVER's own hostname (its PTR/reverse-DNS
-record, used by Postfix as myhostname/HELO) - not something exclusive to
-${dom} alone. The MX above therefore points at mx1.${dom} instead of
-${mailhost}, so this domain can get its own independent DANE/TLSA policy
-later without silently sharing it with the server's own identity or any
-other domain (DANE is keyed on the MX hostname, not the recipient
-domain). See dns-records-reference.md for the full reasoning.
-EOF
-    fi
-
-    cat <<EOF
 
 -- SPF / DKIM / DMARC (anti-spoofing) --
 @                       3600    TXT     "v=spf1 mx -all"
@@ -763,21 +753,21 @@ _smtp._tls              3600    TXT     "v=TLSRPTv1; rua=mailto:${TLSRPT_RUA}"
 -- DANE (optional, only recommended if your DNS provider can be updated
    automatically - see note below) --
 (DANE ${dane_status})
+(set up with: manage-dane.sh, see its own --status/--setup)
+
+If you plan to use DANE/TLSA for ${dom}: set up a dedicated MX hostname
+first, not ${mailhost} directly - DANE is keyed on the MX hostname, and
+${mailhost} could end up being THIS SERVER's own hostname (its PTR/
+reverse-DNS record, used by Postfix as myhostname/HELO) rather than
+something exclusive to ${dom} alone, which would silently tie this
+domain's DANE policy to the server's own identity or another domain
+hosted here. The usual fix is a dedicated "mx1" hostname:
+mx1                     3600    A       ${PRIMARY_IPV4}
+mx1                     3600    AAAA    ${PRIMARY_IPV6}
+@                       3600    MX      10 mx1.${dom}.    (instead of the MX above)
+See dns-records-reference.md for the full reasoning. Not needed at all
+if you don't plan to use DANE for this domain.
 EOF
-    if [[ "$needs_dedicated_mx" -eq 1 ]]; then
-        cat <<EOF
-(set up with: manage-dane.sh, see its own --status/--setup - already has
-its own dedicated MX hostname, mx1.${dom}, set up above specifically so
-DANE for this domain never gets tied to the server's own shared identity
-or any other domain hosted here)
-EOF
-    else
-        cat <<EOF
-(set up with: manage-dane.sh, see its own --status/--setup - ${mailhost}
-is already exclusive to this domain, not shared with the server's own
-identity or any other domain, so no extra MX hostname is needed first)
-EOF
-    fi
 
     cat <<EOF
 
