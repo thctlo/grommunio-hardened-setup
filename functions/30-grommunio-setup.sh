@@ -107,6 +107,11 @@ echo "  Domain       : ${SETUP_DOMAIN:-<not set>}"
 echo "  TLS          : ${SETUP_TLS:-<not set>}"
 echo "  Relay        : ${SETUP_RELAY:-<not set>}"
 echo
+echo "  Optional feature applications screen (checkboxes): enable ALL THREE -"
+echo "  grommunio-chat, grommunio-files, grommunio-keycloak. This project's"
+echo "  later steps (SSO, boot order, the chat/files setup scripts) assume"
+echo "  all three are installed."
+echo
 
 # ============================================================
 # Prerequisite: mariadb-client, BEFORE grommunio-setup, to dodge the known
