@@ -96,6 +96,26 @@ if [[ -z "$PRIMARY_IPV6" ]]; then
     [[ -n "$PRIMARY_IPV6" ]] && log "Auto-detected primary IPv6: ${PRIMARY_IPV6} (step 10 has not saved one yet)."
 fi
 
+# Same idea for NEW_FQDN: a PTR lookup on the address just found above -
+# exactly what step 10 itself would determine as this server's own
+# hostname. Without this, cmd_report's own mx1-vs-mail decision (see
+# there - identical check to 31-grommunio-domain.sh's
+# hint_dedicated_mx_if_needed) can never fire before step 10 has run,
+# even though the PTR record needed to make that call already exists
+# and is exactly what --firstdomain itself checks. Found live
+# 2026-11-14: --report on the domain that will become the first one
+# didn't show the mx1 records it should have, pre-install.
+if [[ -z "${NEW_FQDN:-}" ]]; then
+    ptr_out=""
+    [[ -n "$PRIMARY_IPV4" ]] && ptr_out="$(resolvectl query "$PRIMARY_IPV4" 2>/dev/null | head -n1)"
+    [[ -z "$ptr_out" && -n "$PRIMARY_IPV6" ]] && ptr_out="$(resolvectl query "$PRIMARY_IPV6" 2>/dev/null | head -n1)"
+    if [[ "$ptr_out" == *": "* ]]; then
+        NEW_FQDN="$(sed -E 's/^[^:]+:[[:space:]]*//; s/[[:space:]]+--.*$//; s/[[:space:]]+$//; s/\.$//' <<< "$ptr_out")"
+        [[ -n "$NEW_FQDN" ]] && log "Auto-detected this server's hostname from its own PTR record: ${NEW_FQDN} (step 10 has not saved one yet)."
+    fi
+    unset ptr_out
+fi
+
 RSPAMD_DKIM_DIR="/var/lib/rspamd/dkim"
 
 # TLSRPT reports are centralized to one address for every domain on this
