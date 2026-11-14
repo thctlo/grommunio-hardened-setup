@@ -236,6 +236,8 @@ for i in "${!FUNCTION_FILES[@]}"; do
         echo
         echo "     (--domain/--hostname do not need to be repeated either way -"
         echo "     step 10 already saved them for replay.)"
+        echo
+        echo "     grommunio's own manual: https://docs.grommunio.com/admin/manual_core/"
         print_backup_manifest
         exit 0
     fi
