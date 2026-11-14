@@ -13,10 +13,10 @@
 #     as the brotli/vhost-traffic-status modules from 33-nginx-sites.sh), and
 #     ships /etc/nginx/modsecurity.conf with SecRuleEngine set to
 #     DetectionOnly (log, don't block) out of the box. This step's own
-#     /etc/nginx/modsec/main.conf overrides that to `SecRuleEngine On`
-#     (blocking) - see the comment next to that line for why. Findings
-#     (blocked or, during the original tuning period, would-have-been-
-#     blocked) land in /var/log/nginx/modsec_audit.log.
+#     /etc/nginx/modsec/main.conf now keeps that package default
+#     (DetectionOnly) rather than overriding it to `On` - see the comment
+#     next to that line for why. Findings (blocked, or in DetectionOnly
+#     would-have-been-blocked) land in /var/log/nginx/modsec_audit.log.
 #   - modsecurity-crs ships the actual OWASP rules under
 #     /usr/share/modsecurity-crs/rules/, including a ready-made Nextcloud
 #     exclusion set (grommunio-files is Nextcloud-based) that should cut
@@ -839,15 +839,22 @@ UNIT
 # the same files, which all exist (shipped by modsecurity-crs itself).
 Include /etc/nginx/modsecurity.conf
 
-# Overrides the package's own DetectionOnly default (set in the Include
-# above). DetectionOnly ran live on testvps from 2026-10-12 to 2026-10-21
-# specifically to tune away false positives using real traffic (see the
-# id:9000001-9000009 exclusions below) before ever blocking anything -
-# that tuning is now done and proven (nginx -t + reload + webmail/admin-web
-# smoke-tested clean after each change), so a fresh provision starts
-# straight in blocking mode with the same tuning already in place, rather
-# than repeating the multi-day observe-then-flip process every time.
-SecRuleEngine On
+# Back to the package's own DetectionOnly default (log, don't block) -
+# reverted 2026-11-14. This ran as `SecRuleEngine On` (blocking) from
+# 2026-10-21 after a tuning period looked clean, but a real false positive
+# (rules 920170/920340 blocking every WebDAV PUT upload to grommunio-files,
+# resisted several fix attempts - see ids 9000026/9000027 below) surfaced
+# live afterward anyway, on an endpoint that had already been tuned and
+# smoke-tested. "Tuned and proven clean" clearly does not hold up as a
+# bar for leaving this in blocking mode by default - DetectionOnly (log
+# everything, block nothing) is the standing default now, so a bad rule
+# match is discovered by reading the audit log, not by breaking a real
+# feature in production. All the specific exclusions below (ids
+# 9000001-9000027) stay in place regardless - they are still correct,
+# they are just no longer load-bearing for whether an install works.
+# Flip to On by hand (edit $load, nginx -t, reload) only after watching
+# this server's own modsec_audit.log for a while with real traffic.
+SecRuleEngine DetectionOnly
 
 # Overrides the package's own body-size defaults (set in the Include
 # above: SecRequestBodyLimit 13107200 = 12.5MB, SecRequestBodyNoFilesLimit
@@ -948,10 +955,11 @@ EOF
     nginx -t || die "nginx -t failed after enabling ModSecurity - check $conf and $load."
     systemctl reload nginx || die "nginx reload failed after enabling ModSecurity."
 
-    if grep -q '^SecRuleEngine On$' "$load" 2>/dev/null; then
-        log "[ OK ] SecRuleEngine is On (blocking) - tuned via ids 9000001-9000009 in $excl."
+    if grep -q '^SecRuleEngine DetectionOnly$' "$load" 2>/dev/null; then
+        log "[ OK ] SecRuleEngine is DetectionOnly (log, don't block) - the standing default since 2026-11-14."
+        log "       Findings land in /var/log/nginx/modsec_audit.log; flip to On by hand once reviewed."
     else
-        log "NOTE: SecRuleEngine override not found in $load - check it; this step expects to set blocking mode explicitly, not rely on the package default."
+        log "NOTE: SecRuleEngine override not found in $load - check it; this step expects to set DetectionOnly explicitly, not rely on the package default drifting."
     fi
 
     # ============================================================
