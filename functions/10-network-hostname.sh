@@ -757,23 +757,27 @@ if [[ ! "$APPLY_CONFIG" =~ ^[Yy]$ ]]; then
     return 0
 fi
 
+## Only the Netplan archive lives here - everything else this step
+## actually modifies (the networkd file, /etc/hostname, /etc/hosts,
+## /etc/resolv.conf) goes through backup_file()/finalize_backup()
+## below, same as every other step in this project, each recorded in
+## the one shared manifest. This directory used to also copy those
+## same files a second time (plus the whole /etc/systemd/network/
+## directory, not just the one file this step writes to it) - pure
+## duplication of what backup_file() already covers, found live
+## 2026-11-14. What's left here (the netplan archive + this README)
+## genuinely doesn't fit backup_file()'s single-file model: an entire
+## directory being retired wholesale as part of a backend migration,
+## not one file being replaced.
 local NETMIGR_BACKUP_ROOT="/root/network-migration-backup"
 local NETMIGR_BACKUP_DIR="${NETMIGR_BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$NETMIGR_BACKUP_DIR"
 
 echo; echo "Creating backup:"; echo "  $NETMIGR_BACKUP_DIR"; echo
 
-[[ -e /etc/hostname ]] && cp -a /etc/hostname "$NETMIGR_BACKUP_DIR/hostname"
-[[ -e /etc/hosts ]] && cp -a /etc/hosts "$NETMIGR_BACKUP_DIR/hosts"
-[[ -e /etc/resolv.conf || -L /etc/resolv.conf ]] && cp -a /etc/resolv.conf "$NETMIGR_BACKUP_DIR/resolv.conf"
-
 if [[ -d /etc/netplan ]]; then
     mkdir -p "$NETMIGR_BACKUP_DIR/netplan"
     cp -a /etc/netplan/. "$NETMIGR_BACKUP_DIR/netplan/" 2>/dev/null || true
-fi
-if [[ -d /etc/systemd/network ]]; then
-    mkdir -p "$NETMIGR_BACKUP_DIR/systemd-network"
-    cp -a /etc/systemd/network/. "$NETMIGR_BACKUP_DIR/systemd-network/" 2>/dev/null || true
 fi
 
 cat > "$NETMIGR_BACKUP_DIR/README" <<EOF
@@ -816,17 +820,9 @@ $NETMIGR_BACKUP_DIR
 Original Netplan configuration:
 $NETMIGR_BACKUP_DIR/netplan/
 
-Original hostname:
-/etc/hostname
-
-Original hosts:
-/etc/hosts
-
-Original resolv.conf:
-/etc/resolv.conf
-
-Original systemd-networkd configuration:
-$NETMIGR_BACKUP_DIR/systemd-network/
+The networkd file, /etc/hostname, /etc/hosts and /etc/resolv.conf this
+run changed are backed up the standard way instead - see
+/root/backups/<this run's timestamp>/ and its manifest, not here.
 EOF
 
 echo "Backup complete."; echo
@@ -867,8 +863,10 @@ systemctl is-active --quiet systemd-resolved || systemctl start systemd-resolved
 
 if [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then
     if [[ "$(readlink -f /etc/resolv.conf 2>/dev/null || true)" != "/run/systemd/resolve/stub-resolv.conf" ]]; then
+        backup_file /etc/resolv.conf
         rm -f /etc/resolv.conf
         ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+        finalize_backup /etc/resolv.conf
     fi
 else
     ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
