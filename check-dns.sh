@@ -55,8 +55,14 @@
 #                                        step 10) - no domain argument,
 #                                        this is about the server's own
 #                                        identity, not any one hosted
-#                                        domain. See dns-records-reference.md
-#                                        for why this identity matters for
+#                                        domain. Runs fine before step 10
+#                                        too (auto-detects the primary
+#                                        IPv4/IPv6 via the default route
+#                                        if step 10 hasn't saved one yet;
+#                                        the hostname-match check just
+#                                        gets skipped with a note). See
+#                                        dns-records-reference.md for why
+#                                        this identity matters for
 #                                        DANE/mx1 on whichever domain
 #                                        happens to share it.
 
@@ -69,6 +75,26 @@ source "${SCRIPT_DIR}/functions/00-common.sh"
 NET_CFG="$(cfg_file 10-network-hostname)"
 NEW_FQDN="" NEW_DOMAIN="" PRIMARY_IPV4="" PRIMARY_IPV6=""
 [[ -f "$NET_CFG" ]] && source "$NET_CFG"
+
+# Auto-detect the primary IPv4/IPv6 when step 10 hasn't run yet (its own
+# saved config always wins when present - this only fills a gap, never
+# overrides it). This script is explicitly meant to be runnable BEFORE
+# server-setup.sh (see docs/INSTALL.md's Quick Start: "confirm your
+# server's own DNS identity is already correct" before running anything
+# else) - found live 2026-11-14 that a truly fresh clone hard-failed
+# here instead. `ip route get` only consults the routing table (no
+# packet sent), same default-route logic step 10 itself uses to find
+# the primary interface, just non-interactive (one address, not a user
+# choice among several) - fine for this read-only check; nothing here
+# is saved to disk.
+if [[ -z "$PRIMARY_IPV4" ]]; then
+    PRIMARY_IPV4="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || true)"
+    [[ -n "$PRIMARY_IPV4" ]] && log "Auto-detected primary IPv4: ${PRIMARY_IPV4} (step 10 has not saved one yet)."
+fi
+if [[ -z "$PRIMARY_IPV6" ]]; then
+    PRIMARY_IPV6="$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | grep -oP 'src \K\S+' || true)"
+    [[ -n "$PRIMARY_IPV6" ]] && log "Auto-detected primary IPv6: ${PRIMARY_IPV6} (step 10 has not saved one yet)."
+fi
 
 RSPAMD_DKIM_DIR="/var/lib/rspamd/dkim"
 
@@ -581,7 +607,7 @@ cmd_report()
     local dom="$1" mailhost
     mailhost="mail.${dom}"
     [[ -n "$PRIMARY_IPV4" || -n "$PRIMARY_IPV6" ]] \
-        || die "No primary IPv4/IPv6 saved for this server (run step 10 first)."
+        || die "Could not determine this server's primary IPv4/IPv6 (not saved by step 10 yet, and auto-detection via 'ip route get' found nothing - check this server has a default route/network connectivity)."
 
     # See 31-grommunio-domain.sh's hint_dedicated_mx_if_needed (same check,
     # same reasoning): if mail.<domain> is ALSO this server's own canonical
@@ -819,7 +845,7 @@ EOF
 cmd_firstdomain()
 {
     [[ -n "$PRIMARY_IPV4" || -n "$PRIMARY_IPV6" ]] \
-        || die "No primary IPv4/IPv6 saved for this server (run step 10 first)."
+        || die "Could not determine this server's primary IPv4/IPv6 (not saved by step 10 yet, and auto-detection via 'ip route get' found nothing - check this server has a default route/network connectivity)."
 
     section "PTR (reverse DNS)"
     local ptr_v4="" ptr_v6="" out rest
