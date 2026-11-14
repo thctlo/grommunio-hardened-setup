@@ -646,6 +646,7 @@ PRIMARY_IPV6="${PRIMARY_IPV6%/*}"
 # ============================================================
 
 NETWORKD_FILE="/root/10-${INTERFACE}.network"
+local NETWORKD_INSTALL_TARGET="/etc/systemd/network/10-${INTERFACE}.network"
 
 # Backs up a PRE-EXISTING review file from an earlier run of this step
 # (replay), not /etc - the /etc backup happens separately below, right
@@ -728,8 +729,13 @@ echo "============================================================"
 echo " Install systemd-networkd configuration"
 echo "============================================================"
 echo
-echo "The following files have been generated:"
-echo; echo "  $NETWORKD_FILE"; echo "  $HOSTNAME_FILE"; echo "  $HOSTS_FILE"; echo
+echo "The following files have been generated for review - nothing has"
+echo "been installed yet:"
+echo
+echo "  $NETWORKD_FILE  (will install to: $NETWORKD_INSTALL_TARGET)"
+echo "  $HOSTNAME_FILE  (will install to: /etc/hostname)"
+echo "  $HOSTS_FILE  (will install to: /etc/hosts)"
+echo
 echo "They contain:"
 echo
 echo "  Interface : $INTERFACE"
@@ -752,8 +758,14 @@ local APPLY_CONFIG
 read -r -p "Install and activate systemd-networkd now? [y/N]: " APPLY_CONFIG
 if [[ ! "$APPLY_CONFIG" =~ ^[Yy]$ ]]; then
     echo; echo "Nothing was changed."; echo
-    echo "Review the generated files manually:"
-    echo; echo "  $NETWORKD_FILE"; echo "  $HOSTNAME_FILE"; echo "  $HOSTS_FILE"; echo
+    echo "Review the generated files manually - each would install to the"
+    echo "path shown, not run automatically until you re-run this step and"
+    echo "confirm:"
+    echo
+    echo "  $NETWORKD_FILE  (would install to: $NETWORKD_INSTALL_TARGET)"
+    echo "  $HOSTNAME_FILE  (would install to: /etc/hostname)"
+    echo "  $HOSTS_FILE  (would install to: /etc/hosts)"
+    echo
     return 0
 fi
 
@@ -828,10 +840,10 @@ EOF
 echo "Backup complete."; echo
 
 mkdir -p /etc/systemd/network
-backup_file "/etc/systemd/network/10-${INTERFACE}.network"
-install -o root -g root -m 0644 "$NETWORKD_FILE" "/etc/systemd/network/10-${INTERFACE}.network"
-finalize_backup "/etc/systemd/network/10-${INTERFACE}.network"
-echo "Installed:"; echo "  /etc/systemd/network/10-${INTERFACE}.network"; echo
+backup_file "$NETWORKD_INSTALL_TARGET"
+install -o root -g root -m 0644 "$NETWORKD_FILE" "$NETWORKD_INSTALL_TARGET"
+finalize_backup "$NETWORKD_INSTALL_TARGET"
+echo "Installed:"; echo "  $NETWORKD_INSTALL_TARGET"; echo
 
 backup_file /etc/hostname
 install -o root -g root -m 0644 "$HOSTNAME_FILE" /etc/hostname
