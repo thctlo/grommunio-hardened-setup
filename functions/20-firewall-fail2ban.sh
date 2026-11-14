@@ -191,8 +191,10 @@ detect_from_ss()
 }
 
 local raw candidate ip
+local ssh_connection_ip
+ssh_connection_ip="$(detect_from_ssh_connection)"
 raw=""
-raw+="$(detect_from_ssh_connection)"$'\n'
+raw+="$ssh_connection_ip"$'\n'
 raw+="$(detect_from_who)"$'\n'
 raw+="$(detect_from_ss)"$'\n'
 
@@ -206,18 +208,59 @@ done <<< "$raw"
 
 [[ "${#DETECTED_IPS[@]}" -gt 0 ]] && mapfile -t DETECTED_IPS < <(printf '%s\n' "${DETECTED_IPS[@]}" | sort -u)
 
-WHITELIST_IPS=("${SAVED_WHITELIST_IPS[@]}" "${DETECTED_IPS[@]}")
-
 if [[ "${#SAVED_WHITELIST_IPS[@]}" -gt 0 ]]; then
     log "Saved whitelist from $CFG:"
     for ip in "${SAVED_WHITELIST_IPS[@]}"; do log "  - $ip"; done
 fi
-if [[ "${#DETECTED_IPS[@]}" -gt 0 ]]; then
-    log "Detected current SSH client IP(s):"
-    for ip in "${DETECTED_IPS[@]}"; do log "  - $ip"; done
-else
+
+# There is exactly one real SSH client for this install session. who/ss can
+# surface OTHER logged-in sessions too (another admin, a stale connection),
+# so more than one candidate here is ambiguous - whitelisting the wrong one
+# is a lockout risk, same reasoning as the manual-entry prompt below. Force
+# an explicit single choice instead of silently trusting all of them.
+if [[ "${#DETECTED_IPS[@]}" -eq 0 ]]; then
     log "No SSH client IP could be detected automatically for this session."
+elif [[ "${#DETECTED_IPS[@]}" -eq 1 ]]; then
+    log "Detected current SSH client IP:"
+    log "  - ${DETECTED_IPS[0]}"
+else
+    log "Multiple possible SSH client IPs were detected - who/ss can also see"
+    log "OTHER logged-in sessions, not just this one:"
+    echo
+    local default_idx=0 i
+    for i in "${!DETECTED_IPS[@]}"; do
+        if [[ -n "$ssh_connection_ip" && "${DETECTED_IPS[$i]}" == "$ssh_connection_ip" ]]; then
+            printf '  %d) %s  (default - this session'"'"'s own SSH_CONNECTION)\n' "$((i + 1))" "${DETECTED_IPS[$i]}"
+            default_idx=$((i + 1))
+        else
+            printf '  %d) %s\n' "$((i + 1))" "${DETECTED_IPS[$i]}"
+        fi
+    done
+    echo "  0) None of these - skip, I'll enter it manually below"
+    echo
+    local choice chosen_ip="" prompt_suffix="0-${#DETECTED_IPS[@]}"
+    [[ "$default_idx" -gt 0 ]] && prompt_suffix="$prompt_suffix, default ${default_idx}"
+    while true; do
+        read -r -p "Exactly one of these is your current SSH client IP - which one? [${prompt_suffix}]: " choice
+        [[ -z "$choice" && "$default_idx" -gt 0 ]] && choice="$default_idx"
+        if [[ "$choice" == "0" ]]; then
+            break
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#DETECTED_IPS[@]} )); then
+            chosen_ip="${DETECTED_IPS[$((choice - 1))]}"
+            break
+        fi
+        echo "Invalid choice, try again."
+    done
+    DETECTED_IPS=()
+    [[ -n "$chosen_ip" ]] && DETECTED_IPS+=("$chosen_ip")
+    if [[ -n "$chosen_ip" ]]; then
+        log "Using detected IP: $chosen_ip"
+    else
+        log "Skipped auto-detected IPs; add your own below if needed."
+    fi
 fi
+
+WHITELIST_IPS=("${SAVED_WHITELIST_IPS[@]}" "${DETECTED_IPS[@]}")
 
 # Always give the operator a chance to add IPs — detection can be wrong
 # (jump hosts, NAT, multiple admins) and a wrong whitelist means a lockout.
