@@ -389,8 +389,14 @@ EOF
     echo "Repo configured: $COMMUNITY_URL (community, baseline) +"
     echo "file://${REPO_DIR} (personal, $deb_count package(s), pinned above community)"
     echo
-    echo "Refresh the personal pool anytime by re-copying .debs into"
-    echo "$REPO_DIR and re-running this step."
+    echo "Refresh the personal pool anytime after publishing new/updated"
+    echo "packages here (e.g. via repo-setup's publish-to-server.sh on the"
+    echo "build host) with:"
+    echo
+    echo "  sudo /root/bin/refresh-personal-repo.sh"
+    echo
+    echo "(no need to re-run this step for that - it only re-asks the"
+    echo "community-vs-personal choice, which does not change)."
     echo
 }
 

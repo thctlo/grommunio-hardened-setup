@@ -58,27 +58,45 @@ orchestration layer for building/publishing these, kept separate from
 this one since it's about *maintaining* packages, not installing a
 server.)
 
-Then, on the mail server itself, copy the resulting pool of `.deb`
-files anywhere (e.g. `scp -r` from the build host's
-`/srv/apt-repo/pool`) and run **Step 25**
-(`functions/25-apt-repo-personal.sh`) choosing **option 2** - pointing
-it at that directory when asked. That one step does everything else:
-generates the package index, adds the local repo as a second apt
-source, and writes an APT preferences file pinning it above community
-(`Pin: release o=personal-build`, priority 900 - matching a unique
-`Origin:` this repo's own generated `Release` file sets, not a bare
-"local source" match, which turned out to also match Debian's own
-base/backports sources when configured via a `mirror+file://` URI).
-Priority, not version number, decides the winner: a package present
-in both resolves from your local pool even if community's copy has a
-higher version number - intentional, since your own pool is a manual
-copy that can otherwise go stale unnoticed, but it also means you
-should refresh the pool (re-copy the `.deb`s, re-run Step 25) when you
-actually want a newer upstream version for one of these packages
-specifically. The step verifies both halves worked before finishing:
-`grommunio-setup`'s candidate still comes from community, and at
-least one of your own pool's packages resolves from the local repo
-instead.
+Then, on the build host, publish the pool to the mail server over SSH
+(no manual `scp -r` needed - `repo-setup`'s own
+[`publish-to-server.sh`](https://github.com/thctlo/repo-setup/blob/main/scripts/publish-to-server.sh)
+rsyncs it there):
+
+```
+./publish-to-server.sh mail.example.com
+```
+
+(see that script's own usage for the SSH-key setup that makes this
+non-interactive - a plain `ssh-copy-id` from the build host's own
+`builder` user is all it takes, once.)
+
+The FIRST time, run **Step 25**
+(`functions/25-apt-repo-personal.sh`) on the mail server itself,
+choosing **option 2** - pointing it at that directory when asked. That
+one step does everything else: generates the package index, adds the
+local repo as a second apt source, and writes an APT preferences file
+pinning it above community (`Pin: release o=personal-build`, priority
+900 - matching a unique `Origin:` this repo's own generated `Release`
+file sets, not a bare "local source" match, which turned out to also
+match Debian's own base/backports sources when configured via a
+`mirror+file://` URI). Priority, not version number, decides the
+winner: a package present in both resolves from your local pool even
+if community's copy has a higher version number - intentional, since
+your own pool is a manual copy that can otherwise go stale unnoticed.
+
+From then on, after any further `publish-to-server.sh` run, just
+refresh the index with this project's own standalone
+[`refresh-personal-repo.sh`](../../refresh-personal-repo.sh) - no need
+to go through Step 25/server-setup.sh again:
+
+```
+sudo ./refresh-personal-repo.sh
+```
+
+Either way, the verification is the same: `grommunio-setup`'s
+candidate still comes from community, and at least one of your own
+pool's packages resolves from the local repo instead.
 
 After that: `apt-get install grommunio-archive`/
 `python3-certbot-dns-transip` as normal - `apt-cache policy <package>`
