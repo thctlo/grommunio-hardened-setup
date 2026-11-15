@@ -173,6 +173,7 @@ anything this framework invents:
 | `f2b-subnet-detect.sh` | Resolves an IP's real registered network block for fail2ban's subnet-ban action |
 | `ensure-train-ham-folders.sh` | Creates the TRAIN-HAM folder for users grommunio-admin has no hook for; also installed as a daily timer by step 38 |
 | `install-unattended-upgrades.sh` | Unattended-upgrades setup with a protected-package pre-flight check (optional local override file for site-specific additions) |
+| `reset-keycloak-admin-password.sh` | Recovers access to the Keycloak master-realm admin console when its auto-generated password was never seen/saved - the official bootstrap-admin recovery path, scripted |
 
 ## Project structure
 
