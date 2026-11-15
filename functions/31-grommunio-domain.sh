@@ -206,21 +206,35 @@ echo
 
 # hint_dedicated_mx_if_needed <domain>
 #
-# Whether this domain's natural MX target (mail.<domain>) is ALSO this
-# server's own canonical hostname - the one found via PTR by step 10,
-# the one Postfix uses as myhostname/HELO, the one hostnamectl set. If
-# so, that one shared name is already "spoken for" as the server's own
-# identity, not this domain's alone - giving it an independent MX
-# hostname (conventionally "mx1", but any name not already in use would
-# do) is what actually lets this domain run its own DANE/TLSA policy
-# later. If the server's own hostname is something else entirely (a
-# provider-assigned rDNS string unrelated to any hosted domain, for
-# example), there IS no collision: mail.<domain> is already this
-# domain's own, nothing else shares it, and nothing extra is needed.
+# Whether this domain's natural MX target (mail.<domain>) is ALSO what
+# Postfix actually uses as its own identity (myhostname/HELO). If so,
+# that name is already "spoken for" as the server's own identity, not
+# this domain's alone - giving it an independent MX hostname
+# (conventionally "mx1", but any name not already in use would do) is
+# what actually lets this domain run its own DANE/TLSA policy later.
+#
+# Postfix's identity is NOT always the system/web hostname (NEW_FQDN) -
+# step 10 may have set up a SEPARATE mx-hostname (NEW_MX_FQDN, via
+# --mx-hostname or auto-suggested from PTR) specifically so Postfix's
+# identity never collides with any domain's own mail.<domain> at all.
+# When that separate identity exists, there is no collision for ANY
+# domain, full stop - checking NEW_MX_FQDN first, not NEW_FQDN
+# directly, is what makes this correct for that case. Only when no
+# separate mx-hostname was set up does Postfix fall back to NEW_FQDN,
+# and only then can mail.<domain> actually collide with it.
+#
+# REAL BUG FOUND AND FIXED 2026-11-15: this used to compare NEW_FQDN
+# directly against mail.<domain>, unconditionally - the exact
+# conflation (system hostname == Postfix identity, always) that the
+# --mx-hostname split (step 10) was introduced to undo elsewhere in
+# this project. Left unfixed here, it would still have warned about a
+# collision that the mx-hostname split had already resolved - the
+# same class of stale-detection bug already found and fixed once in
+# check-dns.sh's cmd_report() (commit 56edadf) for the same reason.
 #
 # Deliberately NOT gated to "the first domain": the actual trigger is
-# whether THIS domain's mail.<domain> happens to equal the server's own
-# hostname, which usually (but not necessarily) is the first domain -
+# whether THIS domain's mail.<domain> happens to equal Postfix's own
+# identity, which usually (but not necessarily) is the first domain -
 # it depends entirely on what the PTR/A record say, not on creation
 # order. Called for every domain, every time step_grommunio_domain
 # creates or recovers one.
@@ -228,26 +242,27 @@ hint_dedicated_mx_if_needed()
 {
 local domain="$1"
 local needs_dedicated_mx=0
-if [[ -n "${NEW_FQDN:-}" && "$NEW_FQDN" == "mail.${domain}" ]]; then
+if [[ -z "${NEW_MX_FQDN:-}" && -n "${NEW_FQDN:-}" && "$NEW_FQDN" == "mail.${domain}" ]]; then
     needs_dedicated_mx=1
 fi
 
 if [[ "$needs_dedicated_mx" -eq 1 ]]; then
     echo
     echo "------------------------------------------------------------"
-    echo " mail.${domain} is this server's own hostname - give this domain its own MX"
+    echo " mail.${domain} is Postfix's own identity - give this domain its own MX"
     echo "------------------------------------------------------------"
     echo
-    echo "This server's own hostname (found via PTR/reverse DNS by step 10,"
-    echo "used by Postfix as myhostname/HELO, set via hostnamectl) is"
-    echo "mail.${domain} - the exact name this domain would otherwise use as"
-    echo "its own MX target. Since that name is the server's shared identity,"
-    echo "not something exclusive to ${domain}, DANE (TLSA) can never be"
-    echo "enabled for just this domain while it shares that MX name: DANE is"
-    echo "keyed on the MX hostname, not the recipient domain, so it would"
-    echo "silently apply to anything else that ever uses that same hostname"
-    echo "too (see dns-records-reference.md, section 'First domain only: a"
-    echo "dedicated mx1 MX target', for the full reasoning)."
+    echo "No separate mx-hostname was set up (--mx-hostname, see step 10), so"
+    echo "Postfix falls back to using the system hostname as its own identity"
+    echo "(myhostname/HELO) - and that happens to be mail.${domain}, the exact"
+    echo "name this domain would otherwise use as its own MX target. Since"
+    echo "that name is the server's shared identity, not something exclusive"
+    echo "to ${domain}, DANE (TLSA) can never be enabled for just this domain"
+    echo "while it shares that MX name: DANE is keyed on the MX hostname, not"
+    echo "the recipient domain, so it would silently apply to anything else"
+    echo "that ever uses that same hostname too (see dns-records-reference.md,"
+    echo "section 'First domain only: a dedicated mx1 MX target', for the"
+    echo "full reasoning)."
     echo
     echo "Give ${domain} its own, otherwise-unused MX hostname instead - by"
     echo "convention mx1.${domain}, though any free name works the same way:"
@@ -260,6 +275,10 @@ if [[ "$needs_dedicated_mx" -eq 1 ]]; then
     echo "certificate) and, if DANE is wanted now, manage-dane.sh --setup."
     echo
 else
-    log "[ OK ] ${domain}: mail.${domain} is not this server's own hostname - no dedicated MX hostname needed, independent DANE is already possible for it if wanted."
+    if [[ -n "${NEW_MX_FQDN:-}" ]]; then
+        log "[ OK ] ${domain}: Postfix has its own separate mx-hostname ($NEW_MX_FQDN) - mail.${domain} can never collide with it, independent DANE is already possible if wanted."
+    else
+        log "[ OK ] ${domain}: mail.${domain} is not Postfix's own identity - no dedicated MX hostname needed, independent DANE is already possible for it if wanted."
+    fi
 fi
 }
