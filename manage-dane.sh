@@ -46,8 +46,9 @@
 #     see the chicken-and-egg note in --setup). Every other domain
 #     already has its own mail.<domain> on the certificate from its
 #     normal setup.
-#   - TransIP credentials at /etc/letsencrypt/transip/accounts.d/account1.ini
-#     + /etc/letsencrypt/transip/keys/account1.key (see
+#   - TransIP credentials for this domain, in one of
+#     /etc/letsencrypt/transip/accounts.d/*.ini (matched per domain via
+#     that account's own dns_transip_domains - see
 #     docs/certbot-dns-transip-setup, or project-certbot-dns-transip memory).
 #
 # Usage:
