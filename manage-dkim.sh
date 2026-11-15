@@ -26,6 +26,18 @@
 #                                  whatever it finds missing or wrong, via the
 #                                  TransIP API (TransIP only - see below) -
 #                                  for every domain that already has a local key.
+#   manage-dkim.sh --report        Not a check - prints every signed domain's
+#                                  own DKIM records (dkim-ed/dkim-rsa TXT,
+#                                  dkim CNAME), copy-paste-ready for a
+#                                  registrar that needs them added by hand.
+#   --brief                        Modifier for --status/--report/--setup:
+#                                  only [FAIL]/[WARN] lines and a one-line
+#                                  summary, no [ OK ] lines.
+#   --mail [<address>]             Modifier for --status/--report/--setup:
+#                                  also emails the exact output via this
+#                                  server's own MTA. Default recipient (no
+#                                  address given): admin@<first active
+#                                  domain> - the hub mailbox step 31 creates.
 #
 # --all/-domain generation is a full, idempotent pass, not an "add only" diff:
 #   - creates both DKIM keys (Ed25519 + RSA 2048) per domain, keeping any that
@@ -78,7 +90,7 @@ DKIM_DEFAULT_TTL=300
 
 show_help()
 {
-    sed -n '3,54p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,66p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # make_dkim_key <domain> <selector> <type> [bits]: creates one key, keeps an existing one
@@ -228,22 +240,24 @@ check_txt_selector()
     expected="$(normalize_dkim_value "$(cat "$txt_file")")"
 
     if ! dns_out="$(resolvectl query --type=TXT "${sel}._domainkey.${dom}" 2>/dev/null)"; then
-        echo "[FAIL] ${sel}._domainkey.${dom}: no TXT record found in DNS."
+        failline "${sel}._domainkey.${dom}: no TXT record found in DNS."
         return 1
     fi
     actual="$(normalize_dkim_value "$dns_out")"
 
     if [[ -z "$actual" ]]; then
-        echo "[FAIL] ${sel}._domainkey.${dom}: TXT record found but could not be parsed."
+        failline "${sel}._domainkey.${dom}: TXT record found but could not be parsed."
         return 1
     fi
     if [[ "$actual" == "$expected" ]]; then
-        echo "[ OK ] ${sel}._domainkey.${dom}: matches."
+        okline "${sel}._domainkey.${dom}: matches."
         return 0
     fi
-    echo "[FAIL] ${sel}._domainkey.${dom}: DNS value does not match the local key."
-    echo "         expected: $expected"
-    echo "         DNS has:  $actual"
+    failline "${sel}._domainkey.${dom}: DNS value does not match the local key."
+    if [[ "$BRIEF" -ne 1 ]]; then
+        echo "         expected: $expected"
+        echo "         DNS has:  $actual"
+    fi
     return 1
 }
 
@@ -254,16 +268,16 @@ check_dkim_cname()
     local dns_out actual
 
     if ! dns_out="$(resolvectl query --type=CNAME "dkim._domainkey.${dom}" 2>/dev/null)"; then
-        echo "[FAIL] dkim._domainkey.${dom}: no CNAME record found in DNS."
+        failline "dkim._domainkey.${dom}: no CNAME record found in DNS."
         return 1
     fi
     actual="$(sed -nE 's/^.*IN[[:space:]]+CNAME[[:space:]]+([^[:space:]]+).*/\1/p' <<< "$dns_out" | sed 's/\.$//')"
     expected="${expected%.}"
     if [[ "$actual" == "$expected" ]]; then
-        echo "[ OK ] dkim._domainkey.${dom}: CNAME to $expected."
+        okline "dkim._domainkey.${dom}: CNAME to $expected."
         return 0
     fi
-    echo "[FAIL] dkim._domainkey.${dom}: expected CNAME to $expected, DNS has: ${actual:-<none>}"
+    failline "dkim._domainkey.${dom}: expected CNAME to $expected, DNS has: ${actual:-<none>}"
     return 1
 }
 
@@ -299,7 +313,7 @@ setup_txt_selector()
     fi
 
     if [[ -n "$actual" && "$actual" == "$expected" ]]; then
-        log "[ OK ] ${name}.${dom}: already matches."
+        [[ "$BRIEF" -eq 1 ]] || log "[ OK ] ${name}.${dom}: already matches."
         return 0
     fi
 
@@ -342,7 +356,7 @@ setup_dkim_cname()
     fi
 
     if [[ "$actual" == "$expected" ]]; then
-        log "[ OK ] ${name}.${dom}: already matches."
+        [[ "$BRIEF" -eq 1 ]] || log "[ OK ] ${name}.${dom}: already matches."
         return 0
     fi
 
@@ -414,14 +428,23 @@ cmd_validate()
         die "No domains have a local DKIM key yet (run --all or -domain <name> first)."
     fi
 
-    local d failed=0 checked=0
+    local d failed=0 checked=0 domain_out domain_failed
     for d in "${domains[@]}"; do
-        echo
-        echo "=== $d ==="
         checked=$((checked + 1))
-        check_txt_selector "$d" "$RSPAMD_DKIM_ED_SELECTOR" || failed=$((failed + 1))
-        check_txt_selector "$d" "$RSPAMD_DKIM_RSA_SELECTOR" || failed=$((failed + 1))
-        check_dkim_cname "$d" || failed=$((failed + 1))
+        domain_failed=0
+        domain_out="$(
+            check_txt_selector "$d" "$RSPAMD_DKIM_ED_SELECTOR" || echo "__FAIL__"
+            check_txt_selector "$d" "$RSPAMD_DKIM_RSA_SELECTOR" || echo "__FAIL__"
+            check_dkim_cname "$d" || echo "__FAIL__"
+        )"
+        domain_failed="$(grep -c '__FAIL__' <<< "$domain_out")"
+        domain_out="$(grep -v '__FAIL__' <<< "$domain_out")"
+        failed=$((failed + domain_failed))
+        if [[ "$domain_failed" -gt 0 || "$BRIEF" -ne 1 ]]; then
+            echo
+            echo "=== $d ==="
+            printf '%s\n' "$domain_out"
+        fi
     done
 
     echo
@@ -434,6 +457,42 @@ cmd_validate()
 }
 
 # ============================================================
+# cmd_report: standalone, copy-paste-friendly DNS record block for
+# every domain that already has local DKIM keys - not a check, just
+# "what to publish", matching check-dns.sh --report's own spirit but
+# scoped to only what THIS script manages (DKIM TXT + CNAME).
+# ============================================================
+
+cmd_report()
+{
+    local -a domains=()
+    while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(signed_domains)
+    [[ "${#domains[@]}" -gt 0 ]] || die "No domains have a local DKIM key yet (run --all or -domain <name> first)."
+
+    local d sel txt_file value
+    for d in "${domains[@]}"; do
+        echo "DKIM records for ${d}"
+        echo "======================"
+        echo
+        for sel in "$RSPAMD_DKIM_ED_SELECTOR" "$RSPAMD_DKIM_RSA_SELECTOR"; do
+            txt_file="$RSPAMD_DKIM_DIR/$d.$sel.txt"
+            [[ -f "$txt_file" ]] || continue
+            value="$(normalize_dkim_value "$(cat "$txt_file")")"
+            echo "  Name:  ${sel}._domainkey.${d}"
+            echo "  Type:  TXT"
+            echo "  Value: \"${value}\""
+            echo
+        done
+        echo "  Name:  dkim._domainkey.${d}"
+        echo "  Type:  CNAME"
+        echo "  Value: dkim-rsa._domainkey.${d}."
+        echo
+    done
+    echo "Publish these exact records at your DNS registrar."
+    echo "Re-run manage-dkim.sh --status afterward to confirm they match."
+}
+
+# ============================================================
 # Argument parsing
 # ============================================================
 
@@ -442,7 +501,7 @@ if [[ $# -eq 0 ]]; then
     exit 0
 fi
 
-ACTION="" TARGET_DOMAIN=""
+ACTION="" TARGET_DOMAIN="" MAIL_TO=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --all)
@@ -454,6 +513,16 @@ while [[ $# -gt 0 ]]; do
             ACTION="validate"; shift ;;
         --setup)
             ACTION="setup"; shift ;;
+        --report)
+            ACTION="report"; shift ;;
+        --brief)
+            BRIEF=1; shift ;;
+        --mail)
+            if [[ -n "${2:-}" && "$2" == *"@"* ]]; then
+                MAIL_TO="$2"; shift 2
+            else
+                MAIL_TO="$(default_report_mail_to)"; shift
+            fi ;;
         -h|--help)
             show_help; exit 0 ;;
         *)
@@ -465,28 +534,44 @@ done
 require_root
 require_cmd grommunio-admin
 
-case "$ACTION" in
-    all)
-        mapfile -t ALL_DOMAINS < <(all_active_domains)
-        [[ "${#ALL_DOMAINS[@]}" -gt 0 ]] || die "No active domains found (grommunio-admin domain list)."
-        log "Generating DKIM for ${#ALL_DOMAINS[@]} active domain(s): ${ALL_DOMAINS[*]}"
-        cmd_generate "${ALL_DOMAINS[@]}"
-        ;;
-    domain)
-        mapfile -t ALL_DOMAINS < <(all_active_domains)
-        found=0
-        for a in "${ALL_DOMAINS[@]}"; do [[ "$a" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
-        [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' is not an active grommunio domain (grommunio-admin domain list)."
-        cmd_generate "$TARGET_DOMAIN"
-        ;;
-    validate)
-        cmd_validate
-        ;;
-    setup)
-        cmd_setup
-        ;;
-    *)
-        show_help
-        exit 1
-        ;;
-esac
+run_action()
+{
+    case "$ACTION" in
+        all)
+            mapfile -t ALL_DOMAINS < <(all_active_domains)
+            [[ "${#ALL_DOMAINS[@]}" -gt 0 ]] || die "No active domains found (grommunio-admin domain list)."
+            log "Generating DKIM for ${#ALL_DOMAINS[@]} active domain(s): ${ALL_DOMAINS[*]}"
+            cmd_generate "${ALL_DOMAINS[@]}"
+            ;;
+        domain)
+            mapfile -t ALL_DOMAINS < <(all_active_domains)
+            found=0
+            for a in "${ALL_DOMAINS[@]}"; do [[ "$a" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
+            [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' is not an active grommunio domain (grommunio-admin domain list)."
+            cmd_generate "$TARGET_DOMAIN"
+            ;;
+        validate)
+            cmd_validate
+            ;;
+        setup)
+            cmd_setup
+            ;;
+        report)
+            cmd_report
+            ;;
+        *)
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+if [[ -n "$MAIL_TO" ]]; then
+    [[ -n "$ACTION" ]] || die "--mail needs an action (--status, --setup or --report)."
+    OUTPUT="$(run_action 2>&1)"
+    printf '%s\n' "$OUTPUT"
+    send_report_mail "$MAIL_TO" "manage-dkim.sh ${ACTION}" "$OUTPUT"
+    log "[ OK ] Report mailed to ${MAIL_TO}."
+else
+    run_action
+fi

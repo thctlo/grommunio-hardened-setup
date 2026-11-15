@@ -172,6 +172,64 @@ require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "Required command '$1' not found."
 }
 
+# ============================================================
+# --brief support for manage-*.sh's own --status/--report/--setup
+# output. A caller sets BRIEF=1 before running its checks; okline()
+# then silently drops [ OK ] lines while failline()/warnline() always
+# print - giving the exact "only what needs attention, one-line
+# summary" shape check-dns.sh's own --brief already had, now shared
+# instead of three scripts reimplementing the same filter separately.
+# Added 2026-11-15 alongside --report/--mail for manage-dane.sh/
+# manage-dkim.sh/manage-mta-sts.sh - the three tools that can actually
+# write DNS records, per the operator's own request to add these consistently
+# wherever that's true.
+# ============================================================
+BRIEF="${BRIEF:-0}"
+
+okline()   { [[ "$BRIEF" -eq 1 ]] || echo "[ OK ] $*"; }
+failline() { echo "[FAIL] $*"; }
+warnline() { echo "[WARN] $*"; }
+
+# ============================================================
+# --mail support: every manage-*.sh --mail option sends its captured
+# output through the LOCAL MTA (sendmail -t) - no mailx/mail binary
+# dependency (confirmed not installed; only /usr/sbin/sendmail is).
+# ============================================================
+
+# default_report_mail_to: "admin@<first active domain>" - the hub
+# mailbox step 31 creates for every server, the default --mail
+# recipient whenever one isn't given explicitly. Prints nothing if
+# there is no active domain yet (nothing to default to).
+default_report_mail_to()
+{
+    local first
+    first="$(first_active_domain)"
+    [[ -n "$first" ]] && echo "admin@${first}"
+}
+
+# send_report_mail <to> <subject> <body>: plain-text report mail via
+# sendmail -t. From is root@<this server's own real FQDN> (NEW_FQDN if
+# step 10 saved one, else `hostname -f`) - matches what any other
+# local cron/report mail on this server already looks like.
+send_report_mail()
+{
+    local to="$1" subject="$2" body="$3"
+    local net_cfg new_fqdn="" from
+    net_cfg="$(cfg_file 10-network-hostname)"
+    [[ -f "$net_cfg" ]] && source "$net_cfg" 2>/dev/null
+    from="root@${NEW_FQDN:-$(hostname -f 2>/dev/null || echo localhost)}"
+    require_cmd sendmail
+    {
+        echo "From: ${from}"
+        echo "To: ${to}"
+        echo "Subject: ${subject}"
+        echo "Date: $(date -R)"
+        echo "Content-Type: text/plain; charset=UTF-8"
+        echo
+        echo "$body"
+    } | sendmail -t
+}
+
 is_valid_ipv4() {
     local ip="$1"
     local IFS='.'

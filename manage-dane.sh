@@ -66,6 +66,26 @@
 #                                                  DANE_DOMAINS list so a
 #                                                  future key rotation keeps
 #                                                  it in sync too.
+#   manage-dane.sh [-domain <name>] --report     Not a check - prints just
+#                                                  this domain's own TLSA
+#                                                  record (name/type/value),
+#                                                  copy-paste-ready for a
+#                                                  registrar that needs it
+#                                                  added by hand.
+#   --brief                                       Modifier for --status/
+#                                                  --report/--setup: only
+#                                                  [FAIL]/[WARN] lines and a
+#                                                  one-line summary, no
+#                                                  [ OK ] lines.
+#   --mail [<address>]                            Modifier for --status/
+#                                                  --report/--setup: also
+#                                                  emails the exact output
+#                                                  via this server's own
+#                                                  MTA. Default recipient
+#                                                  (no address given):
+#                                                  admin@<first active
+#                                                  domain> - the hub
+#                                                  mailbox step 31 creates.
 #
 # --setup writes real DNS zone records (via transip-dns). The operator
 # runs this command themselves - an agent must never run --setup (this is
@@ -104,7 +124,7 @@ TTL=3600
 
 show_help()
 {
-    sed -n '3,62p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,98p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # dane_label_for() now lives in functions/00-common.sh - shared with
@@ -139,16 +159,18 @@ cmd_status()
     label="$(dane_label_for "$domain")"
     target="${label}.${domain}"
 
+    local failed=0
+
     echo
     echo "=== DANE status for ${target} (domain: ${domain}, label: ${label}) ==="
-    echo
+    [[ "$BRIEF" -eq 1 ]] || echo
 
     if have_transip_creds "$domain"; then
-        echo "[ OK ] TransIP DNS credentials found for ${domain} - --setup can write DNS records."
+        okline "TransIP DNS credentials found for ${domain} - --setup can write DNS records."
     else
-        echo "[INFO] No TransIP DNS credentials found for ${domain} (no accounts.d/*.ini lists it"
-        echo "       in dns_transip_domains) - --setup can only report, every missing DNS"
-        echo "       record below must be added by hand at your registrar."
+        warnline "No TransIP DNS credentials found for ${domain} (no accounts.d/*.ini lists it in"
+        echo "       dns_transip_domains) - --setup can only report, every missing DNS record"
+        echo "       below must be added by hand at your registrar."
     fi
 
     # Every resolvectl query below is guarded with `if ! out=...` before
@@ -169,24 +191,27 @@ cmd_status()
         v6="$(grep -oE '[0-9a-fA-F:]+:[0-9a-fA-F:]+' <<< "$out" | head -1)"
     fi
     if [[ -n "$v4" || -n "$v6" ]]; then
-        echo "[ OK ] ${target} resolves (A: ${v4:-<none>}, AAAA: ${v6:-<none>})."
+        okline "${target} resolves (A: ${v4:-<none>}, AAAA: ${v6:-<none>})."
     else
-        echo "[FAIL] ${target} does not resolve at all - needs an A/AAAA record first."
+        failline "${target} does not resolve at all - needs an A/AAAA record first."
+        failed=$((failed + 1))
     fi
 
     local cert_sans
     cert_sans="$(openssl x509 -in /etc/letsencrypt/live/${CERT_NAME}/cert.pem -noout -ext subjectAltName 2>/dev/null)"
     if echo "$cert_sans" | grep -qF "$target"; then
-        echo "[ OK ] ${target} is covered by the certificate."
+        okline "${target} is covered by the certificate."
     else
-        echo "[FAIL] ${target} is NOT yet in the certificate - run manage-certs.sh --all (needs the A/AAAA record above to exist first)."
+        failline "${target} is NOT yet in the certificate - run manage-certs.sh --all (needs the A/AAAA record above to exist first)."
+        failed=$((failed + 1))
     fi
 
     local renewal_conf="/etc/letsencrypt/renewal/${CERT_NAME}.conf"
     if [[ -f "$renewal_conf" ]] && grep -q '^reuse_key = True$' "$renewal_conf"; then
-        echo "[ OK ] reuse_key is set (TLSA value will stay stable across renewals)."
+        okline "reuse_key is set (TLSA value will stay stable across renewals)."
     else
-        echo "[FAIL] reuse_key is not set - run manage-certs.sh --all."
+        failline "reuse_key is not set - run manage-certs.sh --all."
+        failed=$((failed + 1))
     fi
 
     local tlsa_live="" want_tlsa=""
@@ -202,29 +227,40 @@ cmd_status()
     # longer matched the live certificate at all - the exact kind of
     # silent drift DANE is supposed to prevent, not cause.
     if [[ -z "$tlsa_live" ]]; then
-        echo "[FAIL] No TLSA record published yet at _25._tcp.${target}."
+        failline "No TLSA record published yet at _25._tcp.${target}."
+        failed=$((failed + 1))
     elif [[ -n "$want_tlsa" && "${tlsa_live,,}" != "${want_tlsa,,}" ]]; then
-        echo "[FAIL] TLSA record is stale: published \"${tlsa_live}\", current certificate needs \"${want_tlsa}\" - run --setup to update it."
-        echo "       If --setup already ran: this can just be the record's own TTL not having"
-        echo "       expired yet in a resolver's cache (including this server's own) - compare"
-        echo "       against \`transip-dns list ${domain}\` (bypasses caching) before assuming"
-        echo "       --setup didn't work."
+        failline "TLSA record is stale: published \"${tlsa_live}\", current certificate needs \"${want_tlsa}\" - run --setup to update it."
+        if [[ "$BRIEF" -ne 1 ]]; then
+            echo "       If --setup already ran: this can just be the record's own TTL not having"
+            echo "       expired yet in a resolver's cache (including this server's own) - compare"
+            echo "       against \`transip-dns list ${domain}\` (bypasses caching) before assuming"
+            echo "       --setup didn't work."
+        fi
+        failed=$((failed + 1))
     else
-        echo "[ OK ] TLSA record published and matches the current certificate: ${tlsa_live}"
+        okline "TLSA record published and matches the current certificate: ${tlsa_live}"
     fi
 
     if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then
-        echo "[ OK ] ${domain} is in update-dane-tlsa.sh's DANE_DOMAINS (kept in sync on key rotation)."
+        okline "${domain} is in update-dane-tlsa.sh's DANE_DOMAINS (kept in sync on key rotation)."
     else
-        echo "[FAIL] ${domain} is NOT in update-dane-tlsa.sh's DANE_DOMAINS yet - run --setup, or add \"${domain}:${label}\" by hand."
+        failline "${domain} is NOT in update-dane-tlsa.sh's DANE_DOMAINS yet - run --setup, or add \"${domain}:${label}\" by hand."
+        failed=$((failed + 1))
     fi
 
     if [[ -x "$DEPLOY_HOOK" ]]; then
-        echo "[ OK ] Deploy-hook installed: $DEPLOY_HOOK"
+        okline "Deploy-hook installed: $DEPLOY_HOOK"
     else
-        echo "[FAIL] Deploy-hook not installed - TLSA will not auto-update on renewal."
+        failline "Deploy-hook not installed - TLSA will not auto-update on renewal."
+        failed=$((failed + 1))
     fi
-    echo
+    [[ "$BRIEF" -eq 1 ]] || echo
+    if [[ "$failed" -eq 0 ]]; then
+        echo "SUMMARY: ${target} - all OK."
+    else
+        echo "SUMMARY: ${target} - ${failed} issue(s) found."
+    fi
 }
 
 # ============================================================
@@ -342,11 +378,11 @@ cmd_setup()
             return 1
         fi
     else
-        log "[ OK ] TLSA record already published and matches the current certificate: ${tlsa_live}"
+        [[ "$BRIEF" -eq 1 ]] || log "[ OK ] TLSA record already published and matches the current certificate: ${tlsa_live}"
     fi
 
     if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then
-        log "[ OK ] ${domain} already in update-dane-tlsa.sh's DANE_DOMAINS."
+        [[ "$BRIEF" -eq 1 ]] || log "[ OK ] ${domain} already in update-dane-tlsa.sh's DANE_DOMAINS."
     else
         log "Adding ${domain}:${label} to update-dane-tlsa.sh's DANE_DOMAINS..."
         backup_file "$DANE_TLSA_SCRIPT"
@@ -374,6 +410,35 @@ cmd_setup()
 }
 
 # ============================================================
+# cmd_report: standalone, copy-paste-friendly DNS record block for
+# this domain's own TLSA record - not a status check, just "what to
+# publish", matching check-dns.sh --report's own spirit but scoped to
+# only what THIS script manages (TLSA), not every record a domain
+# needs.
+# ============================================================
+
+cmd_report()
+{
+    local domain="$1" label target want_tlsa
+    [[ -n "$domain" ]] || die "No active domain found (grommunio-admin domain list) - run step 31 first."
+    label="$(dane_label_for "$domain")"
+    target="${label}.${domain}"
+    want_tlsa="$(expected_tlsa_for)"
+    [[ -n "$want_tlsa" ]] || die "Could not compute the expected TLSA value - does /etc/letsencrypt/live/${CERT_NAME}/cert.pem exist yet?"
+
+    echo "DANE/TLSA record for ${target}"
+    echo "================================"
+    echo
+    echo "  Name:  _25._tcp.${target}"
+    echo "  Type:  TLSA"
+    echo "  Value: ${want_tlsa}"
+    echo
+    echo "Publish this exact record at your DNS registrar (TTL: your registrar's"
+    echo "own short-lived-record default is fine, e.g. 300-3600s)."
+    echo "Re-run manage-dane.sh -domain ${domain} --status afterward to confirm it matches."
+}
+
+# ============================================================
 # Argument parsing
 # ============================================================
 
@@ -382,7 +447,7 @@ if [[ $# -eq 0 ]]; then
     exit 0
 fi
 
-ACTION="" TARGET_DOMAIN=""
+ACTION="" TARGET_DOMAIN="" MAIL_TO=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -domain)
@@ -392,6 +457,16 @@ while [[ $# -gt 0 ]]; do
             ACTION="status"; shift ;;
         --setup)
             ACTION="setup"; shift ;;
+        --report)
+            ACTION="report"; shift ;;
+        --brief)
+            BRIEF=1; shift ;;
+        --mail)
+            if [[ -n "${2:-}" && "$2" == *"@"* ]]; then
+                MAIL_TO="$2"; shift 2
+            else
+                MAIL_TO="$(default_report_mail_to)"; shift
+            fi ;;
         -h|--help)
             show_help; exit 0 ;;
         *)
@@ -402,8 +477,22 @@ done
 
 [[ -n "$TARGET_DOMAIN" ]] || TARGET_DOMAIN="$(first_active_domain)"
 
-case "$ACTION" in
-    status) cmd_status "$TARGET_DOMAIN" ;;
-    setup) require_root; cmd_setup "$TARGET_DOMAIN" ;;
-    "") show_help ;;
-esac
+run_action()
+{
+    case "$ACTION" in
+        status) cmd_status "$TARGET_DOMAIN" ;;
+        setup) require_root; cmd_setup "$TARGET_DOMAIN" ;;
+        report) cmd_report "$TARGET_DOMAIN" ;;
+        "") show_help ;;
+    esac
+}
+
+if [[ -n "$MAIL_TO" ]]; then
+    [[ -n "$ACTION" ]] || die "--mail needs an action (--status, --setup or --report)."
+    OUTPUT="$(run_action 2>&1)"
+    printf '%s\n' "$OUTPUT"
+    send_report_mail "$MAIL_TO" "manage-dane.sh ${ACTION} - ${TARGET_DOMAIN}" "$OUTPUT"
+    log "[ OK ] Report mailed to ${MAIL_TO}."
+else
+    run_action
+fi

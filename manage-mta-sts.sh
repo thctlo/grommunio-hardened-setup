@@ -85,6 +85,21 @@
 #                                    the last publish, matching RFC 8461's
 #                                    own requirement that id change
 #                                    whenever the policy does.
+#   manage-mta-sts.sh --report       Not a check - prints every served
+#                                    domain's own _mta-sts TXT record,
+#                                    copy-paste-ready for a registrar
+#                                    that needs it added by hand.
+#   --brief                          Modifier for --status/--report/
+#                                    --setup: only [FAIL]/[WARN] lines
+#                                    and a one-line summary, no [ OK ]
+#                                    lines or served-policy dumps.
+#   --mail [<address>]               Modifier for --status/--report/
+#                                    --setup: also emails the exact
+#                                    output via this server's own MTA.
+#                                    Default recipient (no address
+#                                    given): admin@<first active
+#                                    domain> - the hub mailbox step 31
+#                                    creates.
 #
 # --setup writes real DNS zone records. The operator runs this command
 # themselves - an agent must never run --setup (this is a standing,
@@ -116,7 +131,7 @@ MTA_STS_DEFAULT_TTL=300
 
 show_help()
 {
-    sed -n '3,94p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,109p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 resolves_here()
@@ -336,40 +351,54 @@ cmd_status()
     while read -r d; do [[ -n "$d" ]] && all_domains+=("$d"); done < <(all_active_domains)
 
     local d failed=0 txt policy_url served expected_mx actual_mx
+    local domain_out domain_failed skipped
     for d in "${all_domains[@]}"; do
-        echo
-        echo "=== $d ==="
+        domain_failed=0
+        skipped=0
+        domain_out="$(
+            txt="$(resolvectl query --type=TXT "_mta-sts.${d}" 2>/dev/null | grep -o 'v=STSv1[^"]*' || true)"
+            if [[ -n "$txt" ]]; then
+                okline "_mta-sts.$d TXT record found: $txt"
+            else
+                failline "_mta-sts.$d TXT record not found."
+                echo "__FAIL__"
+            fi
 
-        txt="$(resolvectl query --type=TXT "_mta-sts.${d}" 2>/dev/null | grep -o 'v=STSv1[^"]*' || true)"
-        if [[ -n "$txt" ]]; then
-            echo "[ OK ] _mta-sts.$d TXT record found: $txt"
-        else
-            echo "[FAIL] _mta-sts.$d TXT record not found."
-            failed=$((failed + 1))
-        fi
+            if resolves_here "mta-sts.${d}"; then
+                okline "mta-sts.$d resolves to this server."
+                policy_url="https://mta-sts.${d}/.well-known/mta-sts.txt"
+                served="$(curl -sf --max-time 5 "$policy_url" 2>/dev/null || true)"
+                if [[ -n "$served" ]]; then
+                    if [[ "$BRIEF" -ne 1 ]]; then
+                        echo "[ OK ] Policy served at $policy_url:"
+                        sed 's/^/       /' <<< "$served"
+                    fi
 
-        if resolves_here "mta-sts.${d}"; then
-            echo "[ OK ] mta-sts.$d resolves to this server."
-            policy_url="https://mta-sts.${d}/.well-known/mta-sts.txt"
-            served="$(curl -sf --max-time 5 "$policy_url" 2>/dev/null || true)"
-            if [[ -n "$served" ]]; then
-                echo "[ OK ] Policy served at $policy_url:"
-                sed 's/^/       /' <<< "$served"
-
-                expected_mx="$(policy_mx_for "$d")"
-                actual_mx="$(grep -E '^mx:' <<< "$served" | awk '{print $2}')"
-                if [[ "$actual_mx" == "$expected_mx" ]]; then
-                    echo "[ OK ] Served mx ($actual_mx) matches this domain's real MX hostname."
+                    expected_mx="$(policy_mx_for "$d")"
+                    actual_mx="$(grep -E '^mx:' <<< "$served" | awk '{print $2}')"
+                    if [[ "$actual_mx" == "$expected_mx" ]]; then
+                        okline "Served mx ($actual_mx) matches this domain's real MX hostname."
+                    else
+                        failline "Served mx is '$actual_mx', should be '$expected_mx' (run --reconfigure to fix)."
+                        echo "__FAIL__"
+                    fi
                 else
-                    echo "[FAIL] Served mx is '$actual_mx', should be '$expected_mx' (run --reconfigure to fix)."
-                    failed=$((failed + 1))
+                    failline "Could not fetch $policy_url (nginx not configured? run --all first)."
+                    echo "__FAIL__"
                 fi
             else
-                echo "[FAIL] Could not fetch $policy_url (nginx not configured? run --all first)."
-                failed=$((failed + 1))
+                echo "[SKIP] mta-sts.$d does not resolve to this server - not ours to serve."
+                echo "__SKIP__"
             fi
-        else
-            echo "[SKIP] mta-sts.$d does not resolve to this server - not ours to serve."
+        )"
+        domain_failed="$(grep -c '__FAIL__' <<< "$domain_out")"
+        skipped="$(grep -c '__SKIP__' <<< "$domain_out")"
+        domain_out="$(grep -vE '__FAIL__|__SKIP__' <<< "$domain_out")"
+        failed=$((failed + domain_failed))
+        if [[ "$domain_failed" -gt 0 || ( "$BRIEF" -ne 1 && "$skipped" -eq 0 ) ]]; then
+            echo
+            echo "=== $d ==="
+            printf '%s\n' "$domain_out"
         fi
     done
 
@@ -421,7 +450,7 @@ setup_mta_sts_txt()
     fi
 
     if [[ -n "$actual" && "$actual" == "$expected" ]]; then
-        log "[ OK ] ${name}.${dom}: already matches."
+        [[ "$BRIEF" -eq 1 ]] || log "[ OK ] ${name}.${dom}: already matches."
         return 0
     fi
 
@@ -457,18 +486,22 @@ cmd_setup()
 {
     require_cmd resolvectl
 
-    log "Running --reconfigure first, so the local policy/mx side is correct..."
+    [[ "$BRIEF" -eq 1 ]] || log "Running --reconfigure first, so the local policy/mx side is correct..."
     cmd_reconfigure
 
     local -a domains=()
     while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
     [[ "${#domains[@]}" -gt 0 ]] || die "No mta-sts.<domain> hostname resolves to this server - nothing to publish."
 
-    local d failed=0
+    local d failed=0 domain_out domain_failed
     for d in "${domains[@]}"; do
-        echo
-        echo "=== $d ==="
-        setup_mta_sts_txt "$d" || failed=$((failed + 1))
+        domain_out="$(setup_mta_sts_txt "$d" 2>&1)" && domain_failed=0 || domain_failed=1
+        failed=$((failed + domain_failed))
+        if [[ "$domain_failed" -eq 1 || "$BRIEF" -ne 1 ]]; then
+            echo
+            echo "=== $d ==="
+            printf '%s\n' "$domain_out"
+        fi
     done
 
     echo
@@ -481,6 +514,36 @@ cmd_setup()
 }
 
 # ============================================================
+# cmd_report: standalone, copy-paste-friendly DNS record block for
+# every domain this server actually serves MTA-STS for - not a check,
+# just "what to publish", matching check-dns.sh --report's own spirit
+# but scoped to only what THIS script manages (_mta-sts TXT).
+# ============================================================
+
+cmd_report()
+{
+    require_cmd resolvectl
+
+    local -a domains=()
+    while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
+    [[ "${#domains[@]}" -gt 0 ]] || die "No mta-sts.<domain> hostname resolves to this server - nothing to report."
+
+    local d expected
+    for d in "${domains[@]}"; do
+        expected="$(mta_sts_expected_txt_for "$d")" || { err "${d}: no local policy file yet - run --all first."; continue; }
+        echo "MTA-STS record for ${d}"
+        echo "========================"
+        echo
+        echo "  Name:  _mta-sts.${d}"
+        echo "  Type:  TXT"
+        echo "  Value: \"${expected}\""
+        echo
+    done
+    echo "Publish these exact records at your DNS registrar."
+    echo "Re-run manage-mta-sts.sh --status afterward to confirm they match."
+}
+
+# ============================================================
 # Argument parsing
 # ============================================================
 
@@ -489,7 +552,7 @@ if [[ $# -eq 0 ]]; then
     exit 0
 fi
 
-ACTION="" TARGET_DOMAIN=""
+ACTION="" TARGET_DOMAIN="" MAIL_TO=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --all)
@@ -503,6 +566,16 @@ while [[ $# -gt 0 ]]; do
             ACTION="reconfigure"; shift ;;
         --setup)
             ACTION="setup"; shift ;;
+        --report)
+            ACTION="report"; shift ;;
+        --brief)
+            BRIEF=1; shift ;;
+        --mail)
+            if [[ -n "${2:-}" && "$2" == *"@"* ]]; then
+                MAIL_TO="$2"; shift 2
+            else
+                MAIL_TO="$(default_report_mail_to)"; shift
+            fi ;;
         -h|--help)
             show_help; exit 0 ;;
         *)
@@ -514,29 +587,45 @@ done
 require_root
 require_cmd grommunio-admin
 
-case "$ACTION" in
-    all)
-        cmd_generate
-        ;;
-    domain)
-        mapfile -t ALL_DOMAINS < <(all_active_domains)
-        found=0
-        for a in "${ALL_DOMAINS[@]}"; do [[ "$a" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
-        [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' is not an active grommunio domain (grommunio-admin domain list)."
-        resolves_here "mta-sts.$TARGET_DOMAIN" || die "mta-sts.$TARGET_DOMAIN does not resolve to this server."
-        cmd_generate
-        ;;
-    status)
-        cmd_status
-        ;;
-    reconfigure)
-        cmd_reconfigure
-        ;;
-    setup)
-        cmd_setup
-        ;;
-    *)
-        show_help
-        exit 1
-        ;;
-esac
+run_action()
+{
+    case "$ACTION" in
+        all)
+            cmd_generate
+            ;;
+        domain)
+            mapfile -t ALL_DOMAINS < <(all_active_domains)
+            found=0
+            for a in "${ALL_DOMAINS[@]}"; do [[ "$a" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
+            [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' is not an active grommunio domain (grommunio-admin domain list)."
+            resolves_here "mta-sts.$TARGET_DOMAIN" || die "mta-sts.$TARGET_DOMAIN does not resolve to this server."
+            cmd_generate
+            ;;
+        status)
+            cmd_status
+            ;;
+        reconfigure)
+            cmd_reconfigure
+            ;;
+        setup)
+            cmd_setup
+            ;;
+        report)
+            cmd_report
+            ;;
+        *)
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+if [[ -n "$MAIL_TO" ]]; then
+    [[ -n "$ACTION" ]] || die "--mail needs an action (--status, --setup or --report)."
+    OUTPUT="$(run_action 2>&1)"
+    printf '%s\n' "$OUTPUT"
+    send_report_mail "$MAIL_TO" "manage-mta-sts.sh ${ACTION}" "$OUTPUT"
+    log "[ OK ] Report mailed to ${MAIL_TO}."
+else
+    run_action
+fi
