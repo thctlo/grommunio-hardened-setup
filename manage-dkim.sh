@@ -19,6 +19,10 @@
 #   manage-dkim.sh --validate      Check, for every domain that already has a local
 #                                  key, whether DNS actually publishes the matching
 #                                  dkim-ed, dkim-rsa and dkim (CNAME) records.
+#   manage-dkim.sh --setup         Like --validate, but also PUBLISHES/UPDATES
+#                                  whatever it finds missing or wrong, via the
+#                                  TransIP API (TransIP only - see below) -
+#                                  for every domain that already has a local key.
 #
 # --all/-domain generation is a full, idempotent pass, not an "add only" diff:
 #   - creates both DKIM keys (Ed25519 + RSA 2048) per domain, keeping any that
@@ -29,12 +33,22 @@
 #     to regenerate every time, reloads rspamd only if this file actually changed
 #   - regenerates /root/cfg-server/dkim-dns-records.txt the same way
 #
-# Fully registrar-agnostic: --all/-domain only generate keys and write
-# local files (rspamd config, the records-to-add text file above) - it
-# never writes to any DNS registrar itself, you publish those TXT/CNAME
-# records by hand wherever your zone lives. --validate only reads DNS
-# (resolvectl) to confirm what you published matches. No registrar API
-# of any kind is used anywhere in this script.
+# Registrar-agnostic for --all/-domain/--validate: they only ever generate
+# keys, write local files, or read DNS (resolvectl) - never touch any
+# registrar. --setup is the one action that can WRITE DNS records, and
+# only because the TransIP registrar API happens to be available here
+# (same account.d/*.ini credentials manage-dane.sh uses, matched per
+# domain via dns_transip_domains - see functions/00-common.sh). On a
+# different registrar it still runs, checks for TransIP credentials for
+# each domain, and when they're missing, falls back cleanly: it does
+# NOT crash, it prints the exact record you need to add by hand and
+# exits non-zero for that domain. --setup writes real DNS zone records.
+# The operator runs this command themselves - an agent must never run
+# --setup (this is a standing, absolute rule for every DNS zone-record
+# change in this project, not specific to this script, see
+# manage-dane.sh's own header). An agent may run --validate freely
+# (read-only) and should hand the operator the exact --setup command to
+# run themselves.
 
 set -euo pipefail
 
@@ -49,10 +63,19 @@ RSPAMD_DKIM_RSA_SELECTOR="dkim-rsa"
 RSPAMD_DKIM_RSA_BITS=2048
 SIGN_CFG="/etc/rspamd/local.d/dkim_signing.conf"
 RECORDS="/root/cfg-server/dkim-dns-records.txt"
+# TTL used only when PUBLISHING A NEW record (--setup) - 5 minutes for
+# both TXT and CNAME, matching this project's own documented convention
+# for DKIM/DMARC (see docs/dns-records-reference.md: "Short TTLs (5
+# minutes) on the DKIM and DMARC records make key rotation... take
+# effect quickly"), decided by the operator 2026-11-15. Updating an EXISTING
+# record instead uses its own live TTL (transip_live_ttl_for,
+# functions/00-common.sh) - transip-dns update requires name/type/TTL
+# to match exactly, it cannot change the TTL itself.
+DKIM_DEFAULT_TTL=300
 
 show_help()
 {
-    sed -n '3,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,51p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # make_dkim_key <domain> <selector> <type> [bits]: creates one key, keeps an existing one
@@ -241,6 +264,141 @@ check_dkim_cname()
     return 1
 }
 
+# ============================================================
+# cmd_setup: like cmd_validate, but PUBLISHES/UPDATES whatever it finds
+# missing or wrong, via the TransIP API (transip_account_for() etc.,
+# functions/00-common.sh - same per-domain account resolution
+# manage-dane.sh uses). Degrades the same way manage-dane.sh does: no
+# TransIP credentials for a domain means print the exact manual record
+# and move on, never crash. Adding a brand new record uses the
+# DKIM_DEFAULT_TTL constant above (5 minutes); updating
+# an existing-but-wrong one uses transip_live_ttl_for() instead - the
+# exact lesson learned fixing manage-dane.sh's own stale-TLSA update
+# the same day (transip-dns update requires name/type/TTL to match the
+# live record exactly, TTL itself is not something update can change).
+# ============================================================
+
+setup_txt_selector()
+{
+    local dom="$1" sel="$2" name="${sel}._domainkey"
+    local txt_file="$RSPAMD_DKIM_DIR/$dom.$sel.txt"
+    local expected actual="" dns_out live_ttl user key_file
+
+    if [[ ! -f "$txt_file" ]]; then
+        err "${name}.${dom}: no local key to compare against."
+        return 1
+    fi
+    expected="$(normalize_dkim_value "$(cat "$txt_file")")"
+
+    if dns_out="$(resolvectl query --type=TXT "${name}.${dom}" 2>/dev/null)"; then
+        actual="$(normalize_dkim_value "$dns_out")"
+    fi
+
+    if [[ -n "$actual" && "$actual" == "$expected" ]]; then
+        log "[ OK ] ${name}.${dom}: already matches."
+        return 0
+    fi
+
+    if ! have_transip_creds "$dom"; then
+        err "${name}.${dom}: $([[ -z "$actual" ]] && echo "no TXT record published" || echo "TXT record does not match") and no TransIP credentials are available to fix it."
+        err "  Publish as: ${name}.${dom}  TXT  \"${expected}\""
+        return 1
+    fi
+
+    require_cmd transip-dns
+    user="$(transip_user_for "$dom")"; key_file="$(transip_key_for "$dom")"
+
+    if [[ -z "$actual" ]]; then
+        log "Publishing ${name}.${dom}..."
+        transip-dns --username "$user" --key-file "$key_file" \
+            add "$dom" "$name" TXT "$expected" --ttl "$DKIM_DEFAULT_TTL"
+        log "[ OK ] Published ${name}.${dom}."
+        log "      TTL is ${DKIM_DEFAULT_TTL}s - resolvers (including this server's own"
+        log "      cache) may keep answering with no data for up to that long."
+    else
+        log "${name}.${dom} does not match - updating..."
+        live_ttl="$(transip_live_ttl_for "$dom" "$name" TXT)"
+        [[ -n "$live_ttl" ]] || die "Could not find ${name}.${dom}'s own live TTL via transip-dns list - refusing to guess one for update."
+        transip-dns --username "$user" --key-file "$key_file" \
+            update "$dom" "$name" TXT "$expected" --ttl "$live_ttl"
+        log "[ OK ] Updated ${name}.${dom}."
+        log "      TTL is ${live_ttl}s - resolvers (including this server's own cache) may"
+        log "      keep answering with the OLD value for up to that long."
+    fi
+}
+
+setup_dkim_cname()
+{
+    local dom="$1" name="dkim._domainkey"
+    local expected="dkim-rsa._domainkey.${dom}." actual="" dns_out live_ttl user key_file
+
+    if dns_out="$(resolvectl query --type=CNAME "${name}.${dom}" 2>/dev/null)"; then
+        actual="$(sed -nE 's/^.*IN[[:space:]]+CNAME[[:space:]]+([^[:space:]]+).*/\1/p' <<< "$dns_out")"
+        [[ -n "$actual" ]] && actual="${actual%.}."
+    fi
+
+    if [[ "$actual" == "$expected" ]]; then
+        log "[ OK ] ${name}.${dom}: already matches."
+        return 0
+    fi
+
+    if ! have_transip_creds "$dom"; then
+        err "${name}.${dom}: $([[ -z "$actual" ]] && echo "no CNAME published" || echo "CNAME does not match") and no TransIP credentials are available to fix it."
+        err "  Publish as: ${name}.${dom}  CNAME  ${expected}"
+        return 1
+    fi
+
+    require_cmd transip-dns
+    user="$(transip_user_for "$dom")"; key_file="$(transip_key_for "$dom")"
+
+    if [[ -z "$actual" ]]; then
+        log "Publishing ${name}.${dom}..."
+        transip-dns --username "$user" --key-file "$key_file" \
+            add "$dom" "$name" CNAME "$expected" --ttl "$DKIM_DEFAULT_TTL"
+        log "[ OK ] Published ${name}.${dom}."
+        log "      TTL is ${DKIM_DEFAULT_TTL}s - resolvers (including this server's own"
+        log "      cache) may keep answering with no data for up to that long."
+    else
+        log "${name}.${dom} does not match - updating..."
+        live_ttl="$(transip_live_ttl_for "$dom" "$name" CNAME)"
+        [[ -n "$live_ttl" ]] || die "Could not find ${name}.${dom}'s own live TTL via transip-dns list - refusing to guess one for update."
+        transip-dns --username "$user" --key-file "$key_file" \
+            update "$dom" "$name" CNAME "$expected" --ttl "$live_ttl"
+        log "[ OK ] Updated ${name}.${dom}."
+        log "      TTL is ${live_ttl}s - resolvers (including this server's own cache) may"
+        log "      keep answering with the OLD value for up to that long."
+    fi
+}
+
+cmd_setup()
+{
+    require_cmd resolvectl
+
+    local -a domains=()
+    while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(signed_domains)
+
+    if [[ "${#domains[@]}" -eq 0 ]]; then
+        die "No domains have a local DKIM key yet (run --all or -domain <name> first)."
+    fi
+
+    local d failed=0
+    for d in "${domains[@]}"; do
+        echo
+        echo "=== $d ==="
+        setup_txt_selector "$d" "$RSPAMD_DKIM_ED_SELECTOR" || failed=$((failed + 1))
+        setup_txt_selector "$d" "$RSPAMD_DKIM_RSA_SELECTOR" || failed=$((failed + 1))
+        setup_dkim_cname "$d" || failed=$((failed + 1))
+    done
+
+    echo
+    if [[ "$failed" -eq 0 ]]; then
+        log "[ OK ] DKIM DNS records published/up to date for ${#domains[@]} domain(s)."
+    else
+        err "$failed record(s) could not be published/updated automatically - see [FAIL]/error lines above."
+        return 1
+    fi
+}
+
 cmd_validate()
 {
     require_cmd resolvectl
@@ -290,6 +448,8 @@ while [[ $# -gt 0 ]]; do
             ACTION="domain"; TARGET_DOMAIN="$2"; shift 2 ;;
         --validate)
             ACTION="validate"; shift ;;
+        --setup)
+            ACTION="setup"; shift ;;
         -h|--help)
             show_help; exit 0 ;;
         *)
@@ -317,6 +477,9 @@ case "$ACTION" in
         ;;
     validate)
         cmd_validate
+        ;;
+    setup)
+        cmd_setup
         ;;
     *)
         show_help

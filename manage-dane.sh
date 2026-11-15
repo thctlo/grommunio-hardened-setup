@@ -83,26 +83,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/functions/00-common.sh"
 
-# accounts.d/*.ini (directory mode), not the legacy single-file
-# transip.ini/transip.key pair this script used before 2026-11-04 - that
-# pair was an old, no-longer-used leftover and has since been deleted
-# (confirmed on purpose, not a bug to work around here).
-#
-# Flagged live 2026-11-15: hardcoding "account1" specifically breaks the
-# moment a second TransIP account exists - fixed by resolving the right
-# account PER DOMAIN instead, the same way certbot_dns_transip's own
-# plugin does it (see its _load_account_directory/dns_transip_domains
-# in /usr/lib/python3/dist-packages/certbot_dns_transip/dns_transip.py):
-# each accounts.d/*.ini may list its own "dns_transip_domains" (comma-
-# separated) - the account whose list contains the domain being managed
-# wins. Unlike the plugin, this script does NOT also fall back to a
-# live API probe when no ini hints the domain - --setup/--status only
-# ever run for a domain this server already knows about (step 31), so
-# requiring an explicit dns_transip_domains hint here is a reasonable,
-# much simpler substitute for that same live-probe fallback. CREDS_INI/
-# TRANSIP_KEY are no longer top-level constants - they are resolved
-# per-call by transip_account_for(), right after $domain is known.
-ACCOUNTS_DIR="/etc/letsencrypt/transip/accounts.d"
+# TransIP account helpers (transip_account_for/have_transip_creds/
+# transip_user_for/transip_key_for/transip_live_ttl_for) now live in
+# functions/00-common.sh - shared with manage-dkim.sh's --setup, which
+# needed the exact same per-domain account resolution.
 DANE_TLSA_SCRIPT="${SCRIPT_DIR}/update-dane-tlsa.sh"
 
 # discover_cert_name() (functions/00-common.sh) - NOT a hardcoded
@@ -125,72 +109,6 @@ show_help()
 
 # dane_label_for() now lives in functions/00-common.sh - shared with
 # manage-mta-sts.sh, which needs the exact same per-domain MX hostname.
-
-# transip_account_for <domain>: prints the accounts.d/*.ini path whose
-# own dns_transip_domains (comma-separated, matching the format
-# certbot_dns_transip's own ConfigObj parsing produces - see
-# dns_transip.py) lists this domain, or nothing + returns 1 if no
-# account hints it. Does NOT fall back to a live API probe the way the
-# real certbot plugin does when nothing hints it - --setup/--status
-# only ever run for a domain step 31 already knows about, so requiring
-# an explicit hint here is a reasonable, much simpler substitute.
-transip_account_for()
-{
-    local domain="$1" ini_file domains_line d
-    [[ -d "$ACCOUNTS_DIR" ]] || return 1
-    for ini_file in "$ACCOUNTS_DIR"/*.ini; do
-        [[ -f "$ini_file" ]] || continue
-        domains_line="$(grep '^dns_transip_domains' "$ini_file" | sed 's/.*= *//')"
-        [[ -n "$domains_line" ]] || continue
-        IFS=',' read -ra listed <<< "$domains_line"
-        for d in "${listed[@]}"; do
-            d="${d//[[:space:]]/}"
-            [[ "$d" == "$domain" ]] && { echo "$ini_file"; return 0; }
-        done
-    done
-    return 1
-}
-
-have_transip_creds()
-{
-    local domain="$1" ini_file key_file
-    ini_file="$(transip_account_for "$domain")" || return 1
-    key_file="$(grep '^dns_transip_key_file' "$ini_file" | sed 's/.*= *//')"
-    [[ -n "$key_file" && -f "$key_file" ]]
-}
-
-transip_user_for()
-{
-    local domain="$1" ini_file
-    ini_file="$(transip_account_for "$domain")" || return 1
-    grep '^dns_transip_username' "$ini_file" | sed 's/.*= *//'
-}
-
-transip_key_for()
-{
-    local domain="$1" ini_file
-    ini_file="$(transip_account_for "$domain")" || return 1
-    grep '^dns_transip_key_file' "$ini_file" | sed 's/.*= *//'
-}
-
-# transip_live_ttl_for <domain> <name> <type>: the TTL the record
-# ACTUALLY has right now, straight from the TransIP API via `transip-dns
-# list` (not resolvectl - a resolver's cached/default TTL display can
-# disagree with the authoritative value, and `update` needs the exact
-# live one). REAL BUG FOUND 2026-11-15: the stale-TLSA update path
-# originally passed the script's own $TTL constant (3600) to `--ttl`
-# unconditionally - `transip-dns update` requires name/type/TTL to
-# match the live record exactly (TTL is not something update can
-# change, see its own --help), so this failed outright the moment the
-# live record's real TTL (300, in this case) differed from $TTL.
-transip_live_ttl_for()
-{
-    local domain="$1" name="$2" rtype="$3" user key_file
-    user="$(transip_user_for "$domain")" || return 1
-    key_file="$(transip_key_for "$domain")" || return 1
-    transip-dns --username "$user" --key-file "$key_file" list "$domain" 2>/dev/null \
-        | awk -v n="$name" -v t="$rtype" '$1 == n && $3 == t { print $2; exit }'
-}
 
 # expected_tlsa_for: "3 1 1 <hash>" computed from the CURRENT
 # certificate's public key - the value a correct TLSA record should

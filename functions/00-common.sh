@@ -359,3 +359,89 @@ discover_cert_name()
     done
     echo "${new_mx_fqdn:-${new_fqdn:-mail.example.com}}"
 }
+
+# ============================================================
+# TransIP DNS account helpers - shared by every manage-*.sh tool that
+# can write DNS records via the TransIP API (manage-dane.sh,
+# manage-dkim.sh's --setup). Moved here 2026-11-15 when manage-dkim.sh
+# needed the exact same per-domain account resolution manage-dane.sh
+# had just gained - keeping one copy instead of two that can drift.
+# ============================================================
+
+# accounts.d/*.ini (directory mode), not the legacy single-file
+# transip.ini/transip.key pair this project used before 2026-11-04 -
+# that pair was an old, no-longer-used leftover and has since been
+# deleted (confirmed on purpose, not a bug to work around here).
+#
+# Hardcoding "account1" specifically breaks the moment a second TransIP
+# account exists - resolved PER DOMAIN instead, the same way
+# certbot_dns_transip's own plugin does it (see its
+# _load_account_directory/dns_transip_domains in
+# /usr/lib/python3/dist-packages/certbot_dns_transip/dns_transip.py):
+# each accounts.d/*.ini may list its own "dns_transip_domains" (comma-
+# separated) - the account whose list contains the domain being managed
+# wins. Unlike the plugin, this does NOT also fall back to a live API
+# probe when no ini hints the domain - every caller here only ever
+# touches a domain this server already knows about (step 31), so
+# requiring an explicit dns_transip_domains hint is a reasonable, much
+# simpler substitute for that same live-probe fallback.
+TRANSIP_ACCOUNTS_DIR="${TRANSIP_ACCOUNTS_DIR:-/etc/letsencrypt/transip/accounts.d}"
+
+# transip_account_for <domain>: prints the accounts.d/*.ini path whose
+# own dns_transip_domains (comma-separated, matching the format
+# certbot_dns_transip's own ConfigObj parsing produces) lists this
+# domain, or nothing + returns 1 if no account hints it.
+transip_account_for()
+{
+    local domain="$1" ini_file domains_line d
+    [[ -d "$TRANSIP_ACCOUNTS_DIR" ]] || return 1
+    for ini_file in "$TRANSIP_ACCOUNTS_DIR"/*.ini; do
+        [[ -f "$ini_file" ]] || continue
+        domains_line="$(grep '^dns_transip_domains' "$ini_file" | sed 's/.*= *//')"
+        [[ -n "$domains_line" ]] || continue
+        IFS=',' read -ra listed <<< "$domains_line"
+        for d in "${listed[@]}"; do
+            d="${d//[[:space:]]/}"
+            [[ "$d" == "$domain" ]] && { echo "$ini_file"; return 0; }
+        done
+    done
+    return 1
+}
+
+have_transip_creds()
+{
+    local domain="$1" ini_file key_file
+    ini_file="$(transip_account_for "$domain")" || return 1
+    key_file="$(grep '^dns_transip_key_file' "$ini_file" | sed 's/.*= *//')"
+    [[ -n "$key_file" && -f "$key_file" ]]
+}
+
+transip_user_for()
+{
+    local domain="$1" ini_file
+    ini_file="$(transip_account_for "$domain")" || return 1
+    grep '^dns_transip_username' "$ini_file" | sed 's/.*= *//'
+}
+
+transip_key_for()
+{
+    local domain="$1" ini_file
+    ini_file="$(transip_account_for "$domain")" || return 1
+    grep '^dns_transip_key_file' "$ini_file" | sed 's/.*= *//'
+}
+
+# transip_live_ttl_for <domain> <name> <type>: the TTL the record
+# ACTUALLY has right now, straight from the TransIP API via `transip-dns
+# list` (not resolvectl - a resolver's cached/default TTL display can
+# disagree with the authoritative value, and `transip-dns update`
+# requires the exact live one, name/type/TTL must match the live record
+# exactly - TTL is not something update can change, see its own
+# --help).
+transip_live_ttl_for()
+{
+    local domain="$1" name="$2" rtype="$3" user key_file
+    user="$(transip_user_for "$domain")" || return 1
+    key_file="$(transip_key_for "$domain")" || return 1
+    transip-dns --username "$user" --key-file "$key_file" list "$domain" 2>/dev/null \
+        | awk -v n="$name" -v t="$rtype" '$1 == n && $3 == t { print $2; exit }'
+}
