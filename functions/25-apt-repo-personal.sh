@@ -224,8 +224,8 @@ configure_personal()
         REPO_DIR="$SAVED_REPO_DIR"
         log "Using saved repo directory: $REPO_DIR"
     else
-        read -r -p "Local repo directory [/var/www/html/apt-repo]: " REPO_DIR
-        REPO_DIR="${REPO_DIR:-/var/www/html/apt-repo}"
+        read -r -p "Local repo directory [/srv/apt-repo]: " REPO_DIR
+        REPO_DIR="${REPO_DIR:-/srv/apt-repo}"
     fi
     REPO_DIR="${REPO_DIR%/}"
 
