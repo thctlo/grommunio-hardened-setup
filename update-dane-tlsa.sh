@@ -47,14 +47,16 @@ DANE_DOMAINS=(
 # relying on reuse_key alone.
 #
 # Uses the same transip-dns CLI (python3-transip-rest) already proven live
-# for the mx1.<first domain> A/AAAA records and an MX change - same
-# credentials, same account (account1.ini/.key in directory mode - not
-# the legacy single-file transip.ini/transip.key, which this script used
-# before 2026-11-04; that pair was an old, no-longer-used leftover and
-# has since been deleted, confirmed on purpose, not a bug to work around
-# here). Requires TransIP DNS credentials to already be set up (see
-# manage-dane.sh, which this assumes has already run once for the first
-# domain in DANE_DOMAINS).
+# for the mx1.<first domain> A/AAAA records and an MX change. The right
+# TransIP account for EACH domain is resolved separately (transip_account_for()
+# below) via that account's own dns_transip_domains hint in
+# accounts.d/*.ini - not a single fixed account1.ini/.key for every
+# domain (directory mode, not the legacy single-file transip.ini/
+# transip.key, which this script used before 2026-11-04; that pair was
+# an old, no-longer-used leftover and has since been deleted, confirmed
+# on purpose, not a bug to work around here). Requires TransIP DNS
+# credentials to already be set up (see manage-dane.sh, which this
+# assumes has already run once for every domain in DANE_DOMAINS).
 #
 # Unlike every other DNS-related tool in this project, this one has NO
 # manual-fallback path and hard-requires transip-dns - it dies outright
@@ -84,19 +86,46 @@ CERT_DIR="${1:-${RENEWED_LINEAGE:-/etc/letsencrypt/live/mail.example.com}}"
 CERT_FILE="${CERT_DIR}/cert.pem"
 TTL=3600
 
-CREDS_INI="/etc/letsencrypt/transip/accounts.d/account1.ini"
-KEY_FILE="/etc/letsencrypt/transip/keys/account1.key"
+ACCOUNTS_DIR="/etc/letsencrypt/transip/accounts.d"
 
 log() { echo "[update-dane-tlsa] $*"; }
 die() { echo "[update-dane-tlsa] ERROR: $*" >&2; exit 1; }
 
-[[ -f "$CERT_FILE" ]] || die "Certificate not found: $CERT_FILE"
-[[ -f "$CREDS_INI" ]] || die "TransIP credentials not found: $CREDS_INI"
-[[ -f "$KEY_FILE" ]] || die "TransIP API key not found: $KEY_FILE"
-command -v transip-dns >/dev/null || die "transip-dns not found (python3-transip-rest not installed?)."
+# transip_account_for <domain>: prints the accounts.d/*.ini path whose
+# own dns_transip_domains (comma-separated) lists this domain, or
+# nothing + returns 1 if no account hints it. Same per-domain
+# resolution as functions/00-common.sh's own transip_account_for()
+# (used by manage-dane.sh/manage-dkim.sh/manage-mta-sts.sh) -
+# deliberately duplicated here, not sourced, so this unattended
+# certbot deploy-hook keeps zero dependency on files outside its own
+# deployed copy (same robustness principle as the header's own "no
+# manual-fallback path" design note).
+#
+# REAL BUG FOUND 2026-11-15: this script hardcoded account1.ini/.key
+# for EVERY domain in DANE_DOMAINS, no matter which TransIP account
+# actually owns it - worked only because exactly one account existed.
+# Flagged live by the operator right after the same hardcoding was fixed in
+# manage-dane.sh, which this script was missed by at the time since it
+# runs standalone, not through functions/00-common.sh.
+transip_account_for()
+{
+    local domain="$1" ini_file domains_line d
+    [[ -d "$ACCOUNTS_DIR" ]] || return 1
+    for ini_file in "$ACCOUNTS_DIR"/*.ini; do
+        [[ -f "$ini_file" ]] || continue
+        domains_line="$(grep '^dns_transip_domains' "$ini_file" | sed 's/.*= *//')"
+        [[ -n "$domains_line" ]] || continue
+        IFS=',' read -ra listed <<< "$domains_line"
+        for d in "${listed[@]}"; do
+            d="${d//[[:space:]]/}"
+            [[ "$d" == "$domain" ]] && { echo "$ini_file"; return 0; }
+        done
+    done
+    return 1
+}
 
-TRANSIP_USER="$(grep '^dns_transip_username' "$CREDS_INI" | sed 's/.*= *//')"
-[[ -n "$TRANSIP_USER" ]] || die "Could not read dns_transip_username from $CREDS_INI."
+[[ -f "$CERT_FILE" ]] || die "Certificate not found: $CERT_FILE"
+command -v transip-dns >/dev/null || die "transip-dns not found (python3-transip-rest not installed?)."
 
 NEW_HASH="$(openssl x509 -in "$CERT_FILE" -noout -pubkey \
     | openssl pkey -pubin -outform DER \
@@ -112,6 +141,16 @@ for entry in "${DANE_DOMAINS[@]}"; do
     DOMAIN="${entry%%:*}"
     LABEL="${entry##*:}"
     RECORD_NAME="_25._tcp.${LABEL}"
+
+    INI_FILE="$(transip_account_for "$DOMAIN")" \
+        || { log "[ERROR] No TransIP account found for ${DOMAIN} (no accounts.d/*.ini lists it in dns_transip_domains) - skipping."; FAILED=1; continue; }
+    TRANSIP_USER="$(grep '^dns_transip_username' "$INI_FILE" | sed 's/.*= *//')"
+    KEY_FILE="$(grep '^dns_transip_key_file' "$INI_FILE" | sed 's/.*= *//')"
+    if [[ -z "$TRANSIP_USER" || -z "$KEY_FILE" || ! -f "$KEY_FILE" ]]; then
+        log "[ERROR] Incomplete TransIP credentials in ${INI_FILE} for ${DOMAIN} - skipping."
+        FAILED=1
+        continue
+    fi
 
     CURRENT_LINE="$(transip-dns --username "$TRANSIP_USER" --key-file "$KEY_FILE" list "$DOMAIN" 2>/dev/null \
         | awk -v n="$RECORD_NAME" '$1==n && $3=="TLSA"')"
