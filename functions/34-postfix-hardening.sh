@@ -208,6 +208,60 @@ else
     log "[ OK ] No dedicated mx-hostname from step 10 - myhostname stays Postfix's own default (this server's system hostname)."
 fi
 
+# REAL BUG FOUND 2026-11-15: grommunio's own nginx setup has no vhost of
+# its own - every service (web/auth/dav/files) lives behind ONE
+# "default_server" catch-all block (confirmed live: sites-enabled/ is
+# empty), so it answers on ANY Host header reaching port 443, not just
+# the system/web hostname. Before this project added mx-hostname
+# support, that was harmless - nothing else resolved to this server
+# with a valid cert for anyone to browse to. Now that manage-certs.sh
+# deliberately adds the mx-hostname as a cert SAN (needed for DANE/TLS,
+# see dns-records-reference.md), https://<mx-hostname>/ became a NEW,
+# unintended way to reach the full grommunio-web app - which then
+# builds its own OIDC redirect_uri from THAT Host header, and Keycloak
+# correctly rejects it (its client's redirect URIs only ever list the
+# real system/web hostname - see the Keycloak client fixes this same
+# session). Fixed with a dedicated, minimal vhost for the mx-hostname
+# that does a plain HTTP redirect before any PHP/Keycloak logic runs,
+# so browsing to it just lands on the correct hostname instead of
+# hitting this error.
+NGINX_MX_REDIRECT_CONF="/etc/nginx/conf.d/mx-hostname-redirect.conf"
+if [[ -n "$NEW_MX_FQDN" && "$NEW_MX_FQDN" != "$NEW_FQDN" ]] && command -v nginx >/dev/null 2>&1; then
+    MX_REDIRECT_NEW="$(mktemp)"
+    {
+        echo "# Managed by 34-postfix-hardening.sh - do not edit by hand."
+        echo "# $NEW_MX_FQDN is Postfix's own mail-exchange identity, never a"
+        echo "# real web entry point - redirect any browser hitting it here"
+        echo "# straight to the real system/web hostname, before grommunio-web/"
+        echo "# Keycloak's own location blocks (the default_server catch-all)"
+        echo "# ever see the request."
+        echo "server {"
+        echo "    listen 443 ssl;"
+        echo "    listen [::]:443 ssl;"
+        echo "    http2 on;"
+        echo "    server_name ${NEW_MX_FQDN};"
+        echo "    include /etc/grommunio-common/nginx/ssl_*.conf;"
+        echo "    return 301 https://${NEW_FQDN}\$request_uri;"
+        echo "}"
+    } > "$MX_REDIRECT_NEW"
+
+    if [[ -f "$NGINX_MX_REDIRECT_CONF" ]] && cmp -s "$MX_REDIRECT_NEW" "$NGINX_MX_REDIRECT_CONF"; then
+        log "[ OK ] $NGINX_MX_REDIRECT_CONF already up to date."
+    else
+        backup_file "$NGINX_MX_REDIRECT_CONF"
+        install -m 0644 "$MX_REDIRECT_NEW" "$NGINX_MX_REDIRECT_CONF"
+        finalize_backup "$NGINX_MX_REDIRECT_CONF"
+        if nginx -t 2>/dev/null; then
+            systemctl reload nginx || die "nginx did not reload after adding the mx-hostname redirect vhost."
+            log "[ OK ] Wrote $NGINX_MX_REDIRECT_CONF - https://${NEW_MX_FQDN}/ now redirects to https://${NEW_FQDN}/."
+        else
+            rm -f "$NGINX_MX_REDIRECT_CONF"
+            die "nginx -t failed after adding $NGINX_MX_REDIRECT_CONF - reverted, check by hand."
+        fi
+    fi
+    rm -f "$MX_REDIRECT_NEW"
+fi
+
 finalize_backup "$MAIN_CF"
 if [[ "$changed" -eq 1 ]]; then
     postfix check || die "postfix check failed after the hardening changes - restore from the .bak file just written."
