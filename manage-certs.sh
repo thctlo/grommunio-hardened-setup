@@ -48,10 +48,13 @@
 #   manage-certs.sh -domain <name>  Same full recompute, but additionally
 #                                   fail loudly if this one domain's own
 #                                   hostnames do not resolve here.
-#   manage-certs.sh --validate      Check DNS + the live certificate's SAN
+#   manage-certs.sh --status        Check DNS + the live certificate's SAN
 #                                   list against what every active domain
 #                                   should have, and report the cert's
-#                                   expiry.
+#                                   expiry. Read-only, changes nothing.
+#                                   (--validate is a kept alias, same
+#                                   naming as manage-mta-sts.sh/manage-
+#                                   mfa.sh's own --status.)
 
 set -euo pipefail
 
@@ -67,7 +70,7 @@ CERT_DIR="/etc/letsencrypt/live/${CERT_NAME}"
 
 show_help()
 {
-    sed -n '3,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,57p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # resolves_here <hostname>: does it have an A/AAAA record matching this
@@ -281,7 +284,7 @@ while [[ $# -gt 0 ]]; do
         -domain)
             [[ -n "${2:-}" ]] || die "-domain needs a value."
             ACTION="domain"; TARGET_DOMAIN="$2"; shift 2 ;;
-        --validate)
+        --status|--validate)
             ACTION="validate"; shift ;;
         -h|--help)
             show_help; exit 0 ;;
