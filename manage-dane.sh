@@ -287,6 +287,10 @@ cmd_status()
         echo "[FAIL] No TLSA record published yet at _25._tcp.${target}."
     elif [[ -n "$want_tlsa" && "${tlsa_live,,}" != "${want_tlsa,,}" ]]; then
         echo "[FAIL] TLSA record is stale: published \"${tlsa_live}\", current certificate needs \"${want_tlsa}\" - run --setup to update it."
+        echo "       If --setup already ran: this can just be the record's own TTL not having"
+        echo "       expired yet in a resolver's cache (including this server's own) - compare"
+        echo "       against \`transip-dns list ${domain}\` (bypasses caching) before assuming"
+        echo "       --setup didn't work."
     else
         echo "[ OK ] TLSA record published and matches the current certificate: ${tlsa_live}"
     fi
@@ -380,6 +384,9 @@ cmd_setup()
             transip-dns --username "$user" --key-file "$key_file" \
                 add "$domain" "_25._tcp.${label}" TLSA "$want_tlsa" --ttl "$TTL"
             log "[ OK ] Published TLSA: ${want_tlsa}"
+            log "      TTL is ${TTL}s - resolvers (including this server's own cache) may keep"
+            log "      answering with no/old data for up to that long. A --status run inside"
+            log "      this window can still show [FAIL] even though the record is correct."
         else
             err "No TLSA record exists and no TransIP credentials are available to publish one."
             err "Compute it by hand (usage 3, selector 1, matching-type 1 / SPKI-SHA256):"
@@ -406,6 +413,10 @@ cmd_setup()
             transip-dns --username "$user" --key-file "$key_file" \
                 update "$domain" "_25._tcp.${label}" TLSA "$want_tlsa" --ttl "$live_ttl"
             log "[ OK ] Updated TLSA record: ${tlsa_live} -> ${want_tlsa}"
+            log "      TTL is ${live_ttl}s - resolvers (including this server's own cache) may"
+            log "      keep answering with the OLD value for up to that long. A --status run"
+            log "      inside this window can still show [FAIL] stale even though TransIP's"
+            log "      own answer (transip-dns list ${domain}) is already correct."
         else
             err "Published TLSA record is stale and no TransIP credentials are available to update it."
             err "Current:   _25._tcp.${target}  TLSA  ${tlsa_live}"
