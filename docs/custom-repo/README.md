@@ -109,10 +109,15 @@ rsyncs it there):
 non-interactive - a plain `ssh-copy-id` from the build host's own
 `builder` user is all it takes, once.)
 
-Then, back on the mail server, pick up what was just published with
-this project's own standalone
-[`refresh-personal-repo.sh`](../../refresh-personal-repo.sh) - no need
-to go through Step 25/server-setup.sh again for this part:
+That one command is now the whole publish: `publish-to-server.sh`
+automatically SSHes into the server afterward and runs its own
+standalone [`refresh-personal-repo.sh`](../../refresh-personal-repo.sh)
+for you - no separate manual step, no need to go through Step 25/
+server-setup.sh again for this part. If `refresh-personal-repo.sh`
+isn't on the server yet (Step 25 was never run in personal mode
+there), `publish-to-server.sh` still finishes the publish itself and
+prints the exact manual command to run once it is. To refresh by hand
+at any other time (e.g. after editing something there directly):
 
 ```
 sudo ./refresh-personal-repo.sh

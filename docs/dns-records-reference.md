@@ -35,22 +35,34 @@ The bare domain (`@`) needs its own A/AAAA records (not just the MX target)
 because mail clients and some validators resolve the domain itself, not
 only the mail server's own hostname.
 
-## Only when mail.<domain> is this server's own hostname: a dedicated `mx1` MX target
+## Only when mail.<domain> is Postfix's own identity: a dedicated `mx1` MX target
 
-This server has exactly one canonical hostname: whatever its PTR (reverse
-DNS) record says, found by step 10 and confirmed via that name's own
-forward A/AAAA record (FCrDNS). That hostname is what `hostnamectl` sets,
-and what Postfix uses as `myhostname`/HELO/EHLO identity. It is **not**
-inherently tied to any one domain - it is simply whatever name the PTR
-was set up with, by whoever controls reverse DNS for this IP (usually the
-hosting provider).
+This stack keeps two hostnames deliberately separate (see step 10's
+`--hostname`/`--mx-hostname`, added to resolve exactly the collision this
+section is about):
 
-**The collision this section is about**: if that canonical hostname
-happens to be `mail.<domain>` for one specific domain hosted here - a
-common pattern, since admins often set the PTR that way for their primary
-domain, but not a rule this stack enforces - then `mail.<domain>` is
-already "spoken for" as the *server's* shared identity, not something
-exclusive to that domain alone.
+- The **system/web hostname** (`--hostname`, `NEW_FQDN`) - what
+  `hostnamectl` sets, and what every web-facing service (grommunio-web,
+  Keycloak, grommunio-files) uses as its own public URL. Checked against
+  its own forward A/AAAA record, never against PTR.
+- Postfix's own **mx-hostname** (`--mx-hostname`, `NEW_MX_FQDN`) - what
+  Postfix actually uses as `myhostname`/HELO/EHLO. If one was set up
+  (explicitly, or auto-suggested from this server's PTR record when it
+  differs from the system hostname), it is applied as an explicit
+  `myhostname` override in `/etc/postfix/main.cf` by step 34
+  (`34-postfix-hardening.sh`). If none was set up, Postfix falls back to
+  the system hostname instead.
+
+**The collision this section is about**: only arises when NO separate
+mx-hostname was set up, and the system hostname happens to be
+`mail.<domain>` for one specific domain hosted here - a common pattern,
+since admins often use that name as the system hostname for their
+primary domain, but not a rule this stack enforces. In that case,
+`mail.<domain>` is already "spoken for" as Postfix's own shared identity,
+not something exclusive to that domain alone. The moment a separate
+mx-hostname exists, this collision cannot happen for ANY domain, no
+matter what its own `mail.<domain>` is - Postfix's identity is already
+somewhere else entirely.
 
 **Why that matters**: DANE (TLSA records) is looked up by the *MX target
 hostname*, not by the recipient domain. Anything else that ever shares
@@ -58,7 +70,8 @@ that same MX hostname would be forced to share the exact same DANE policy
 too, with no way to enable it for just the one domain. The fix is to give
 that one domain a second, independent MX hostname that nothing else
 uses - by convention `mx1.<domain>`, though literally any unused name
-works the same way:
+works the same way, and set it as this server's `--mx-hostname` (or let
+step 10 auto-suggest it from PTR):
 
 | Name | TTL | Type | Value |
 |---|---|---|---|
@@ -69,25 +82,28 @@ works the same way:
 `mx1` points at the exact same IP addresses as `mail` - it is not a
 different server, not a different certificate (it is added as an extra
 SAN on the one shared certificate, via `manage-certs.sh` - see its own
-comments), and Postfix itself needs no configuration change at all (it
-listens on the IP regardless of which name was used to reach it; its own
-HELO/EHLO identity and the server's PTR record both stay on
-`mail.example.com`, unchanged, so there is no FCrDNS/HELO-mismatch risk).
+comments). Once `mx1.example.com` is set as this server's `--mx-hostname`,
+step 34 writes it into Postfix's own `myhostname` - a real configuration
+change, unlike the system/web hostname, which stays exactly where it was
+(no FCrDNS/HELO-mismatch risk either way, since the mx-hostname is chosen
+specifically to match PTR).
 
-**If the server's own hostname is something else entirely** (a
-provider-assigned rDNS string unrelated to any domain hosted here, for
-example) - there is no collision: `mail.<domain>` is already exclusive to
-that domain, nothing else shares it, and no dedicated MX hostname is
-needed for it at all. This is decided per domain by what the PTR/A record
-actually say, not by which domain happened to be created first.
+**If no collision applies** (a dedicated mx-hostname already exists, or
+the system hostname is something else entirely - a provider-assigned rDNS
+string unrelated to any domain hosted here, for example) - `mail.<domain>`
+is already exclusive to that domain, nothing else shares it, and no
+dedicated MX hostname is needed for it at all. This is decided per domain
+by what `NEW_MX_FQDN`/the PTR record actually say, not by which domain
+happened to be created first.
 
 `31-grommunio-domain.sh`'s `hint_dedicated_mx_if_needed` checks this
-automatically for every domain it creates (comparing that domain's
-`mail.<domain>` against the server's saved `NEW_FQDN` from step 10) and
-only prints the `mx1` instructions when the comparison actually matches -
-the DNS record itself (and the `manage-certs.sh --all` / `manage-dane.sh
---setup` follow-up) still has to be done by hand, this only tells you
-whether it is needed.
+automatically for every domain it creates (checking the server's saved
+`NEW_MX_FQDN` first, falling back to comparing that domain's
+`mail.<domain>` against `NEW_FQDN` only when no separate mx-hostname
+exists) and only prints the `mx1` instructions when a real collision is
+possible - the DNS record itself (and the `manage-certs.sh --all` /
+`manage-dane.sh --setup` follow-up) still has to be done by hand, this
+only tells you whether it is needed.
 
 ## SPF, DKIM, DMARC
 

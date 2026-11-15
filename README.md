@@ -18,16 +18,17 @@ up from there and closes the gaps a production deployment actually needs:
   nginx wiring, DKIM key generation, and a DNS pre-flight tool
   (`check-dns.sh`) that tells you exactly what to set up, what's already
   live, and what's still missing — for a domain not even hosted here yet.
-- **Correct multi-domain DANE** — detects when a domain's natural
-  `mail.<domain>` MX target collides with the server's own canonical
-  hostname (from its PTR record) and gives it an independent MX hostname
-  automatically, so DANE never gets silently shared between domains.
+- **Correct multi-domain DANE** — Postfix's own identity (`--mx-hostname`,
+  kept deliberately separate from the public `--hostname` every web-facing
+  service uses) is checked against each domain's own `mail.<domain>` MX
+  target, so a collision gets flagged - with the exact DNS records to add
+  - instead of DANE silently getting shared between domains.
 - **Keycloak-native SSO** — grommunio Web, Chat, Files and Archive all
   wired into one Keycloak realm, including the claim-mapper and
   user-profile fixes the official adaptor scripts don't apply on their own.
 - **A real WAF and brute-force defense** — ModSecurity (OWASP CRS) in
   front of every vhost, tuned with real false-positive exclusions found
-  live, plus 20 fail2ban jails covering every exposed service, including
+  live, plus 21 fail2ban jails covering every exposed service, including
   a subnet-aggregating jail that catches distributed brute-force attempts
   spread across many IPs in the same network block, and a `recidive` jail
   that escalates repeat offenders caught by any of the others. See

@@ -1,8 +1,9 @@
 # fail2ban jails set up by this framework
 
-Reference list of every jail this framework enables, across three
+Reference list of every jail this framework enables, across four
 steps (`20-firewall-fail2ban.sh`, `36-fail2ban-mail-jails.sh`,
-`37-fail2ban-gromox-jails.sh`) - **20 jails total**. None of this is
+`37-fail2ban-gromox-jails.sh`, `39-nginx-modsecurity.sh`) - **21 jails
+total**. None of this is
 hypothetical hardening: every `bantime`/`findtime` value below that
 differs from a simple round number was arrived at by sweeping real
 logs on a live, internet-facing deployment and widening whatever a
@@ -66,6 +67,14 @@ real attacker was found pacing just outside.
 | `grommunio-sync` | 37 | `grommunio-sync/grommunio-sync.log` (needs `LOGAUTHFAIL`, enabled by this step) | 1h | 1h | 9 (mobile clients legitimately re-register often) |
 | `grommunio-admin-api` | 37 | admin-api journal, login failures - see above | 2h | 1h | 2 |
 | `gromox-http` | 37 | generic auth-rejected across EWS/RPC/OAB/Autodiscover/web | 1h | 1h | 5 |
+| `nginx-modsecurity` | 39 | `nginx-error.log`, ModSecurity's own "Access denied" blocks (any vhost) | 24h | 8h | 3 |
+
+**`nginx-modsecurity` currently sits idle**: `SecRuleEngine` defaults to
+`DetectionOnly` (log, don't block - see `39-nginx-modsecurity.sh`'s own
+`SecRuleEngine` comment for why), so nothing is ever actually "Access
+denied" for this jail to watch. It activates automatically the moment
+`SecRuleEngine` is switched to `On` by hand - no fail2ban change needed
+either way.
 
 ## Checking jail status
 
