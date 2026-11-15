@@ -280,7 +280,8 @@ check_dkim_cname()
 
 setup_txt_selector()
 {
-    local dom="$1" sel="$2" name="${sel}._domainkey"
+    local dom="$1" sel="$2"
+    local name="${sel}._domainkey"
     local txt_file="$RSPAMD_DKIM_DIR/$dom.$sel.txt"
     local expected actual="" dns_out live_ttl user key_file
 
