@@ -83,18 +83,38 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/functions/00-common.sh"
 
-# account1.ini/.key (directory mode), not the legacy single-file
+# accounts.d/*.ini (directory mode), not the legacy single-file
 # transip.ini/transip.key pair this script used before 2026-11-04 - that
 # pair was an old, no-longer-used leftover and has since been deleted
 # (confirmed on purpose, not a bug to work around here).
-CREDS_INI="/etc/letsencrypt/transip/accounts.d/account1.ini"
-TRANSIP_KEY="/etc/letsencrypt/transip/keys/account1.key"
+#
+# Flagged live 2026-11-15: hardcoding "account1" specifically breaks the
+# moment a second TransIP account exists - fixed by resolving the right
+# account PER DOMAIN instead, the same way certbot_dns_transip's own
+# plugin does it (see its _load_account_directory/dns_transip_domains
+# in /usr/lib/python3/dist-packages/certbot_dns_transip/dns_transip.py):
+# each accounts.d/*.ini may list its own "dns_transip_domains" (comma-
+# separated) - the account whose list contains the domain being managed
+# wins. Unlike the plugin, this script does NOT also fall back to a
+# live API probe when no ini hints the domain - --setup/--status only
+# ever run for a domain this server already knows about (step 31), so
+# requiring an explicit dns_transip_domains hint here is a reasonable,
+# much simpler substitute for that same live-probe fallback. CREDS_INI/
+# TRANSIP_KEY are no longer top-level constants - they are resolved
+# per-call by transip_account_for(), right after $domain is known.
+ACCOUNTS_DIR="/etc/letsencrypt/transip/accounts.d"
 DANE_TLSA_SCRIPT="${SCRIPT_DIR}/update-dane-tlsa.sh"
 
-NET_CFG="$(cfg_file 10-network-hostname)"
-NEW_FQDN="" PRIMARY_IPV4="" PRIMARY_IPV6=""
-[[ -f "$NET_CFG" ]] && source "$NET_CFG"
-CERT_NAME="${NEW_FQDN:-mail.example.com}"
+# discover_cert_name() (functions/00-common.sh) - NOT a hardcoded
+# NEW_FQDN guess. Found live 2026-11-15: this used to hardcode
+# CERT_NAME="${NEW_FQDN:-mail.example.com}", checking the WRONG
+# renewal.conf/cert.pem the moment a dedicated mx-hostname exists (the
+# real cert lives under mx1.<domain>, not mail.<domain>) - explained a
+# real, confusing symptom: --setup reported "reuse_key is not set" and
+# "TLSA record already published" using a stale/orphaned certificate's
+# data, right after manage-certs.sh had just confirmed setting
+# reuse_key on the REAL certificate two lines above in the same run.
+CERT_NAME="$(discover_cert_name)"
 DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/75-update-dane-tlsa"
 TTL=3600
 
@@ -106,14 +126,66 @@ show_help()
 # dane_label_for() now lives in functions/00-common.sh - shared with
 # manage-mta-sts.sh, which needs the exact same per-domain MX hostname.
 
-have_transip_creds()
+# transip_account_for <domain>: prints the accounts.d/*.ini path whose
+# own dns_transip_domains (comma-separated, matching the format
+# certbot_dns_transip's own ConfigObj parsing produces - see
+# dns_transip.py) lists this domain, or nothing + returns 1 if no
+# account hints it. Does NOT fall back to a live API probe the way the
+# real certbot plugin does when nothing hints it - --setup/--status
+# only ever run for a domain step 31 already knows about, so requiring
+# an explicit hint here is a reasonable, much simpler substitute.
+transip_account_for()
 {
-    [[ -f "$CREDS_INI" && -f "$TRANSIP_KEY" ]]
+    local domain="$1" ini_file domains_line d
+    [[ -d "$ACCOUNTS_DIR" ]] || return 1
+    for ini_file in "$ACCOUNTS_DIR"/*.ini; do
+        [[ -f "$ini_file" ]] || continue
+        domains_line="$(grep '^dns_transip_domains' "$ini_file" | sed 's/.*= *//')"
+        [[ -n "$domains_line" ]] || continue
+        IFS=',' read -ra listed <<< "$domains_line"
+        for d in "${listed[@]}"; do
+            d="${d//[[:space:]]/}"
+            [[ "$d" == "$domain" ]] && { echo "$ini_file"; return 0; }
+        done
+    done
+    return 1
 }
 
-transip_user()
+have_transip_creds()
 {
-    grep '^dns_transip_username' "$CREDS_INI" | sed 's/.*= *//'
+    local domain="$1" ini_file key_file
+    ini_file="$(transip_account_for "$domain")" || return 1
+    key_file="$(grep '^dns_transip_key_file' "$ini_file" | sed 's/.*= *//')"
+    [[ -n "$key_file" && -f "$key_file" ]]
+}
+
+transip_user_for()
+{
+    local domain="$1" ini_file
+    ini_file="$(transip_account_for "$domain")" || return 1
+    grep '^dns_transip_username' "$ini_file" | sed 's/.*= *//'
+}
+
+transip_key_for()
+{
+    local domain="$1" ini_file
+    ini_file="$(transip_account_for "$domain")" || return 1
+    grep '^dns_transip_key_file' "$ini_file" | sed 's/.*= *//'
+}
+
+# expected_tlsa_for: "3 1 1 <hash>" computed from the CURRENT
+# certificate's public key - the value a correct TLSA record should
+# have right now. Prints nothing if the certificate doesn't exist (or
+# the key isn't 64 hex chars after hashing) - callers must check for
+# that, never publish/compare against an empty expected value.
+expected_tlsa_for()
+{
+    local hash
+    [[ -f "/etc/letsencrypt/live/${CERT_NAME}/cert.pem" ]] || return 0
+    hash="$(openssl x509 -in "/etc/letsencrypt/live/${CERT_NAME}/cert.pem" -noout -pubkey 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -hex 2>/dev/null | sed 's/^.*= //')"
+    [[ "${#hash}" -eq 64 ]] || return 0
+    echo "3 1 1 ${hash}"
 }
 
 # ============================================================
@@ -134,11 +206,12 @@ cmd_status()
     echo "=== DANE status for ${target} (domain: ${domain}, label: ${label}) ==="
     echo
 
-    if have_transip_creds; then
-        echo "[ OK ] TransIP DNS credentials found - --setup can write DNS records."
+    if have_transip_creds "$domain"; then
+        echo "[ OK ] TransIP DNS credentials found for ${domain} - --setup can write DNS records."
     else
-        echo "[INFO] No TransIP DNS credentials found - --setup can only report, every"
-        echo "       missing DNS record below must be added by hand at your registrar."
+        echo "[INFO] No TransIP DNS credentials found for ${domain} (no accounts.d/*.ini lists it"
+        echo "       in dns_transip_domains) - --setup can only report, every missing DNS"
+        echo "       record below must be added by hand at your registrar."
     fi
 
     # Every resolvectl query below is guarded with `if ! out=...` before
@@ -179,14 +252,24 @@ cmd_status()
         echo "[FAIL] reuse_key is not set - run manage-certs.sh --all."
     fi
 
-    local tlsa_live=""
+    local tlsa_live="" want_tlsa=""
     if out="$(resolvectl query --type=TLSA "_25._tcp.${target}" 2>/dev/null)"; then
         tlsa_live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | head -1)"
     fi
-    if [[ -n "$tlsa_live" ]]; then
-        echo "[ OK ] TLSA record published: ${tlsa_live}"
-    else
+    want_tlsa="$(expected_tlsa_for)"
+    # REAL BUG FOUND 2026-11-15: this used to only check whether ANY TLSA
+    # record existed at this name - never whether its VALUE still matches
+    # the current certificate's key. Confirmed live: a record published
+    # against an earlier key (before reuse_key took effect) was reported
+    # "[ OK ] ... already published" every run since, even though it no
+    # longer matched the live certificate at all - the exact kind of
+    # silent drift DANE is supposed to prevent, not cause.
+    if [[ -z "$tlsa_live" ]]; then
         echo "[FAIL] No TLSA record published yet at _25._tcp.${target}."
+    elif [[ -n "$want_tlsa" && "${tlsa_live,,}" != "${want_tlsa,,}" ]]; then
+        echo "[FAIL] TLSA record is stale: published \"${tlsa_live}\", current certificate needs \"${want_tlsa}\" - run --setup to update it."
+    else
+        echo "[ OK ] TLSA record published and matches the current certificate: ${tlsa_live}"
     fi
 
     if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then
@@ -233,11 +316,12 @@ cmd_setup()
             # problem rather than fix it.
             die "${target} does not resolve, and this is not the first domain (label: ${label}) - its own mail.${domain} A/AAAA should already exist from its normal domain setup. Fix that first, then re-run."
         fi
-        if have_transip_creds; then
+        if have_transip_creds "$domain"; then
             log "Creating ${target} A/AAAA records via transip-dns..."
             require_cmd transip-dns
-            local user ipv4 ipv6 out
-            user="$(transip_user)"
+            local user key_file ipv4 ipv6 out
+            user="$(transip_user_for "$domain")"
+            key_file="$(transip_key_for "$domain")"
             ipv4="" ipv6=""
             if out="$(resolvectl query --type=A "mail.${domain}" 2>/dev/null)"; then
                 ipv4="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<< "$out" | head -1)"
@@ -245,8 +329,8 @@ cmd_setup()
             if out="$(resolvectl query --type=AAAA "mail.${domain}" 2>/dev/null)"; then
                 ipv6="$(grep -oE '[0-9a-fA-F:]+:[0-9a-fA-F:]+' <<< "$out" | head -1)"
             fi
-            [[ -n "$ipv4" ]] && transip-dns --username "$user" --key-file "$TRANSIP_KEY" add "$domain" "$label" A "$ipv4" --ttl 86400
-            [[ -n "$ipv6" ]] && transip-dns --username "$user" --key-file "$TRANSIP_KEY" add "$domain" "$label" AAAA "$ipv6" --ttl 86400
+            [[ -n "$ipv4" ]] && transip-dns --username "$user" --key-file "$key_file" add "$domain" "$label" A "$ipv4" --ttl 86400
+            [[ -n "$ipv6" ]] && transip-dns --username "$user" --key-file "$key_file" add "$domain" "$label" AAAA "$ipv6" --ttl 86400
             log "[ OK ] ${target} A/AAAA created - may take a moment to propagate before the certificate step below can use it."
         else
             err "${target} does not resolve, and no TransIP credentials are available to create it."
@@ -262,32 +346,52 @@ cmd_setup()
     log "Ensuring the certificate covers ${target} and reuse_key is set..."
     "${SCRIPT_DIR}/manage-certs.sh" --all
 
-    local tlsa_live="" out
+    local tlsa_live="" out want_tlsa
     if out="$(resolvectl query --type=TLSA "_25._tcp.${target}" 2>/dev/null)"; then
         tlsa_live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | head -1)"
     fi
+    want_tlsa="$(expected_tlsa_for)"
+    [[ -n "$want_tlsa" ]] || die "Could not compute the expected TLSA value from /etc/letsencrypt/live/${CERT_NAME}/cert.pem - refusing to publish."
+
     if [[ -z "$tlsa_live" ]]; then
-        if have_transip_creds; then
+        if have_transip_creds "$domain"; then
             log "Computing and publishing the initial TLSA record..."
             require_cmd transip-dns
-            local user want_hash
-            user="$(transip_user)"
-            want_hash="$(openssl x509 -in /etc/letsencrypt/live/${CERT_NAME}/cert.pem -noout -pubkey \
-                | openssl pkey -pubin -outform DER | openssl dgst -sha256 -hex | sed 's/^.*= //')"
-            [[ "${#want_hash}" -eq 64 ]] || die "Computed hash is not 64 hex chars - refusing to publish."
-            transip-dns --username "$user" --key-file "$TRANSIP_KEY" \
-                add "$domain" "_25._tcp.${label}" TLSA "3 1 1 ${want_hash}" --ttl "$TTL"
-            log "[ OK ] Published TLSA: 3 1 1 ${want_hash}"
+            local user key_file; user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
+            transip-dns --username "$user" --key-file "$key_file" \
+                add "$domain" "_25._tcp.${label}" TLSA "$want_tlsa" --ttl "$TTL"
+            log "[ OK ] Published TLSA: ${want_tlsa}"
         else
             err "No TLSA record exists and no TransIP credentials are available to publish one."
             err "Compute it by hand (usage 3, selector 1, matching-type 1 / SPKI-SHA256):"
-            err "  openssl x509 -in /etc/letsencrypt/live/mail.${domain}/cert.pem -noout -pubkey \\"
+            err "  openssl x509 -in /etc/letsencrypt/live/${CERT_NAME}/cert.pem -noout -pubkey \\"
             err "    | openssl pkey -pubin -outform DER | openssl dgst -sha256 -hex"
-            err "Publish as: _25._tcp.${target}  TLSA  3 1 1 <that hash>"
+            err "Publish as: _25._tcp.${target}  TLSA  ${want_tlsa}"
+            return 1
+        fi
+    elif [[ "${tlsa_live,,}" != "${want_tlsa,,}" ]]; then
+        # REAL BUG FOUND 2026-11-15: this branch didn't exist at all -
+        # any existing record, however stale, was reported "already
+        # published" and left untouched forever. Using transip-dns
+        # update (name/type/ttl must match the live record exactly,
+        # only content changes), not add - add would create a SECOND,
+        # conflicting TLSA record alongside the stale one instead of
+        # replacing it.
+        if have_transip_creds "$domain"; then
+            log "Published TLSA record is stale (${tlsa_live}) - updating to match the current certificate..."
+            require_cmd transip-dns
+            local user key_file; user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
+            transip-dns --username "$user" --key-file "$key_file" \
+                update "$domain" "_25._tcp.${label}" TLSA "$want_tlsa" --ttl "$TTL"
+            log "[ OK ] Updated TLSA record: ${tlsa_live} -> ${want_tlsa}"
+        else
+            err "Published TLSA record is stale and no TransIP credentials are available to update it."
+            err "Current:   _25._tcp.${target}  TLSA  ${tlsa_live}"
+            err "Should be: _25._tcp.${target}  TLSA  ${want_tlsa}"
             return 1
         fi
     else
-        log "[ OK ] TLSA record already published: ${tlsa_live}"
+        log "[ OK ] TLSA record already published and matches the current certificate: ${tlsa_live}"
     fi
 
     if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then

@@ -321,3 +321,41 @@ dane_label_for()
         echo "mail"
     fi
 }
+
+# discover_cert_name: the REAL name of the one shared Let's Encrypt
+# certificate this stack issues (see manage-certs.sh's own header) -
+# whatever hostname it actually lives under in /etc/letsencrypt/live/,
+# never guessed from the system/web hostname alone. Moved here
+# 2026-11-15 after the same hardcoded "CERT_NAME=${NEW_FQDN:-...}" bug
+# was found independently in both manage-certs.sh and manage-dane.sh:
+# certbot names the live/ directory after whatever --cert-name it was
+# issued with, which on a server with a dedicated mx-hostname is
+# Postfix's own identity (NEW_MX_FQDN), not the web hostname (NEW_FQDN)
+# - confirmed live, the real directory was mx1.example1.eu, not
+# mail.example1.eu. Checks postconf's live myhostname first (the
+# actual source of truth for what the cert SHOULD be named after), then
+# NEW_MX_FQDN/NEW_FQDN as saved-config fallbacks, then whatever single
+# certificate actually exists on disk, so every caller discovers the
+# same name the same way instead of each hardcoding its own guess that
+# can silently drift from reality (and from each other).
+discover_cert_name()
+{
+    local net_cfg new_fqdn="" new_mx_fqdn="" candidate
+    net_cfg="$(cfg_file 10-network-hostname)"
+    [[ -f "$net_cfg" ]] && source "$net_cfg" 2>/dev/null
+    new_fqdn="${NEW_FQDN:-}"; new_mx_fqdn="${NEW_MX_FQDN:-}"
+
+    if command -v postconf >/dev/null 2>&1; then
+        candidate="$(postconf -h myhostname 2>/dev/null || true)"
+        [[ -n "$candidate" && -f "/etc/letsencrypt/live/${candidate}/cert.pem" ]] && { echo "$candidate"; return; }
+    fi
+    for candidate in "$new_mx_fqdn" "$new_fqdn"; do
+        [[ -n "$candidate" && -f "/etc/letsencrypt/live/${candidate}/cert.pem" ]] && { echo "$candidate"; return; }
+    done
+    for candidate in /etc/letsencrypt/live/*/; do
+        [[ -f "${candidate}cert.pem" ]] || continue
+        basename "${candidate%/}"
+        return
+    done
+    echo "${new_mx_fqdn:-${new_fqdn:-mail.example.com}}"
+}
