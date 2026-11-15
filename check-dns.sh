@@ -362,9 +362,9 @@ check_mta_sts()
     if grep -q '^mode: *enforce' <<< "$served"; then
         ok "Policy served at ${policy_url} (mode: enforce)."
     elif grep -q '^mode:' <<< "$served"; then
-        warn "Policy served at ${policy_url} but not in enforce mode: $(grep '^mode:' <<< "$served")"
+        warn "Policy served at ${policy_url} but not in enforce mode: $(grep '^mode:' <<< "$served") (run manage-mta-sts.sh -domain ${dom})."
     else
-        warn "Policy served at ${policy_url} but has no recognizable 'mode:' line."
+        warn "Policy served at ${policy_url} but has no recognizable 'mode:' line (run manage-mta-sts.sh -domain ${dom})."
     fi
 }
 
@@ -374,7 +374,7 @@ check_mta_sts()
 # match), since that is the name DANE/TLSA is looked up by.
 check_dane()
 {
-    local dom="$1" cert="/etc/letsencrypt/live/${NEW_FQDN:-mail.example.com}/cert.pem" out target tlsa_live want_hash
+    local dom="$1" cert="" out target tlsa_live want_hash
     if ! out="$(resolvectl query --type=MX "$dom" 2>/dev/null)"; then
         warn "DANE for $dom: no MX record, cannot determine which hostname to check TLSA on."
         return
@@ -382,6 +382,30 @@ check_dane()
     target="$(sed -nE 's/^[^ ]+ IN MX [0-9]+ ([^ ]+).*/\1/p' <<< "$(head -n1 <<< "$out")")"
     target="${target%.}"
     [[ -n "$target" ]] || { warn "DANE for $dom: MX record has no target."; return; }
+
+    # Find the cert that actually covers $target - NOT assumed to live
+    # under /etc/letsencrypt/live/<target>/ or live/<NEW_FQDN>/: this
+    # project issues ONE shared certificate covering every domain's
+    # mail./mx1. names as SANs, and certbot names the live/ directory
+    # after whichever name was given first when it was issued - found
+    # live 2026-11-15 to be the mx-hostname (mx1.<domain>) here, not the
+    # system/web hostname (NEW_FQDN) this used to hardcode, the same
+    # mx1/mail conflation already fixed elsewhere this session. Checking
+    # live/<target>/ first (the exact name DANE actually cares about)
+    # handles the common case with zero guessing; the SAN scan below is
+    # the fully general fallback for whatever certbot actually named it.
+    if [[ -f "/etc/letsencrypt/live/${target}/cert.pem" ]]; then
+        cert="/etc/letsencrypt/live/${target}/cert.pem"
+    else
+        local candidate
+        for candidate in /etc/letsencrypt/live/*/cert.pem; do
+            [[ -f "$candidate" ]] || continue
+            if openssl x509 -in "$candidate" -noout -ext subjectAltName 2>/dev/null | grep -qiF "$target"; then
+                cert="$candidate"
+                break
+            fi
+        done
+    fi
 
     # resolvectl exits non-zero when nothing is found (same as every
     # other query in this script) - guarded explicitly here too, or
@@ -402,10 +426,10 @@ check_dane()
         if grep -qiF "$want_hash" <<< "$tlsa_live"; then
             ok "DANE for $dom: TLSA at _25._tcp.${target} matches the current certificate."
         else
-            warn "DANE for $dom: TLSA at _25._tcp.${target} does NOT match the current certificate - stale? ($tlsa_live)"
+            warn "DANE for $dom: TLSA at _25._tcp.${target} does NOT match the current certificate - stale (run manage-dane.sh --setup to re-publish it)? ($tlsa_live)"
         fi
     else
-        ok "DANE for $dom: TLSA record found at _25._tcp.${target} ($tlsa_live) - could not verify it matches the certificate (not found at $cert)."
+        ok "DANE for $dom: TLSA record found at _25._tcp.${target} ($tlsa_live) - could not verify it matches the certificate (no certificate under /etc/letsencrypt/live/ covers ${target} as a SAN)."
     fi
 }
 
@@ -518,14 +542,14 @@ check_dkim_selector()
     fi
     expected="$(normalize_dkim_value "$(cat "$txt_file")")"
     if ! out="$(resolvectl query --type=TXT "${sel}._domainkey.${dom}" 2>/dev/null)"; then
-        fail "${sel}._domainkey.${dom}: no TXT record found."
+        fail "${sel}._domainkey.${dom}: no TXT record found - the exact value to publish is in /root/cfg-server/dkim-dns-records.txt (re-run manage-dkim.sh -domain ${dom} if that file is missing or stale)."
         return
     fi
     actual="$(normalize_dkim_value "$out")"
     if [[ "$actual" == "$expected" ]]; then
         ok "${sel}._domainkey.${dom}: matches local key."
     else
-        fail "${sel}._domainkey.${dom}: DNS value does not match the local key."
+        fail "${sel}._domainkey.${dom}: DNS value does not match the local key - the correct value is in /root/cfg-server/dkim-dns-records.txt (re-run manage-dkim.sh -domain ${dom} if that file is missing or stale)."
     fi
 }
 
