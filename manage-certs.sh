@@ -63,9 +63,46 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/functions/00-common.sh"
 
 NET_CFG="$(cfg_file 10-network-hostname)"
-NEW_FQDN="" PRIMARY_IPV4="" PRIMARY_IPV6=""
+NEW_FQDN="" NEW_MX_FQDN="" PRIMARY_IPV4="" PRIMARY_IPV6=""
 [[ -f "$NET_CFG" ]] && source "$NET_CFG"
-CERT_NAME="${NEW_FQDN:-mail.example.com}"
+
+# REAL BUG FOUND 2026-11-15: this used to hardcode CERT_NAME to NEW_FQDN
+# (the system/web hostname) - but certbot names the live/ directory
+# after whatever hostname --cert-name was actually given when the
+# certificate was first issued, which on a server with a dedicated
+# mx-hostname is Postfix's own identity, not the web hostname (confirmed
+# live: the real directory was mx1.example1.eu, not mail.example1.eu -
+# the same mx1/mail conflation already fixed elsewhere this session,
+# missed here). Checking postconf's own live myhostname first - the
+# actual source of truth for what this server's certificate SHOULD be
+# named after, same reasoning check_dane() in check-dns.sh now uses -
+# then NEW_MX_FQDN/NEW_FQDN as saved-config fallbacks, then whatever
+# single certificate actually exists (this project issues exactly one
+# shared certificate for everything), so this never has to guess a name
+# that might not match reality.
+discover_cert_name()
+{
+    local candidate
+    if command -v postconf >/dev/null 2>&1; then
+        candidate="$(postconf -h myhostname 2>/dev/null || true)"
+        [[ -n "$candidate" && -f "/etc/letsencrypt/live/${candidate}/cert.pem" ]] && { echo "$candidate"; return; }
+    fi
+    for candidate in "$NEW_MX_FQDN" "$NEW_FQDN"; do
+        [[ -n "$candidate" && -f "/etc/letsencrypt/live/${candidate}/cert.pem" ]] && { echo "$candidate"; return; }
+    done
+    for candidate in /etc/letsencrypt/live/*/; do
+        [[ -f "${candidate}cert.pem" ]] || continue
+        basename "${candidate%/}"
+        return
+    done
+    # Nothing exists anywhere yet - fall back to what a fresh --all run
+    # would actually request under (Postfix's identity if it has one of
+    # its own, else the web hostname), so a first-ever run still shows a
+    # sensible intended name instead of a hardcoded placeholder.
+    echo "${NEW_MX_FQDN:-${NEW_FQDN:-mail.example.com}}"
+}
+
+CERT_NAME="$(discover_cert_name)"
 CERT_DIR="/etc/letsencrypt/live/${CERT_NAME}"
 
 show_help()
@@ -231,13 +268,15 @@ cmd_validate()
 
     echo
     echo "=== Certificate '$CERT_NAME' ==="
+    local cert_missing=0
     if [[ ! -f "$CERT_DIR/cert.pem" ]]; then
-        echo "[FAIL] No certificate found at $CERT_DIR."
-        return 1
+        echo "[FAIL] No certificate found at $CERT_DIR - run manage-certs.sh --all to request one."
+        cert_missing=1
+    else
+        local expiry
+        expiry="$(openssl x509 -in "$CERT_DIR/cert.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+        echo "Expiry: $expiry"
     fi
-    local expiry
-    expiry="$(openssl x509 -in "$CERT_DIR/cert.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
-    echo "Expiry: $expiry"
     echo "Current SANs: ${current[*]:-<none>}"
     echo "Should cover: ${wanted[*]:-<none>}"
 
