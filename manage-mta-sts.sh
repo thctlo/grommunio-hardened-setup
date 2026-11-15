@@ -7,13 +7,15 @@
 # manage-dkim.sh/manage-certs.sh in spirit: re-run by hand any time a
 # domain is added or removed.
 #
-# MTA-STS needs three things per domain, two of which this script handles:
-#   1. A DNS TXT record at _mta-sts.<domain> ("v=STSv1; id=...") - NOT done
-#      by this script, requires registrar access (--validate only checks,
-#      read-only via resolvectl). Registrar-agnostic for the same reason:
-#      this script never writes DNS itself, regardless of which registrar
-#      is in use - you publish that TXT record by hand wherever your zone
-#      lives, same as manage-dkim.sh.
+# MTA-STS needs three things per domain:
+#   1. A DNS TXT record at _mta-sts.<domain> ("v=STSv1; id=...") - checked
+#      read-only by --status/--validate; --setup can also PUBLISH/UPDATE
+#      it via the TransIP API (same accounts.d/*.ini credentials
+#      manage-dane.sh/manage-dkim.sh use, matched per domain - see
+#      functions/00-common.sh). On a different registrar --setup still
+#      runs, checks for TransIP credentials for each domain, and when
+#      missing, falls back cleanly: prints the exact record to add by
+#      hand and exits non-zero for that domain, never crashes.
 #   2. A certificate covering mta-sts.<domain> - handled by
 #      manage-certs.sh (already extended to include this hostname).
 #   3. The policy file itself, served over HTTPS at exactly
@@ -73,6 +75,23 @@
 #                                    exactly as they are (an enforce-mode
 #                                    promotion, or a hand-tuned max_age,
 #                                    survives).
+#   manage-mta-sts.sh --setup        Runs --reconfigure first (so the local
+#                                    policy file/nginx side is correct),
+#                                    then PUBLISHES/UPDATES each domain's
+#                                    _mta-sts TXT record via TransIP to
+#                                    match - a fresh id (sha256 of the
+#                                    policy file, truncated) whenever the
+#                                    served policy content changed since
+#                                    the last publish, matching RFC 8461's
+#                                    own requirement that id change
+#                                    whenever the policy does.
+#
+# --setup writes real DNS zone records. The operator runs this command
+# themselves - an agent must never run --setup (this is a standing,
+# absolute rule for every DNS zone-record change in this project, not
+# specific to this script - see manage-dane.sh's own header). An agent
+# may run --status/--validate freely (read-only) and should hand the
+# operator the exact --setup command to run themselves.
 
 set -euo pipefail
 
@@ -87,10 +106,17 @@ PRIMARY_IPV4="" PRIMARY_IPV6=""
 POLICY_ROOT="/var/www/mta-sts"
 NGINX_CONF="/etc/nginx/conf.d/mta-sts.conf"
 DEFAULT_MAX_AGE=604800   # 1 week
+# TTL used only when PUBLISHING A NEW _mta-sts TXT record (--setup) - 5
+# minutes, the operator's call 2026-11-15 (no established convention existed
+# for this record before now). Updating an EXISTING record instead
+# uses its own live TTL (transip_live_ttl_for, functions/00-common.sh)
+# - transip-dns update requires name/type/TTL to match exactly, it
+# cannot change the TTL itself.
+MTA_STS_DEFAULT_TTL=300
 
 show_help()
 {
-    sed -n '3,75p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,94p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 resolves_here()
@@ -357,6 +383,104 @@ cmd_status()
 }
 
 # ============================================================
+# cmd_setup: cmd_reconfigure first (so the local policy file/nginx side
+# is correct and the "mx:" line can't be stale), then PUBLISHES/UPDATES
+# each domain's _mta-sts TXT record via TransIP (transip_account_for()
+# etc., functions/00-common.sh - same per-domain account resolution
+# manage-dane.sh/manage-dkim.sh use). Degrades the same way: no TransIP
+# credentials for a domain means print the exact manual record and move
+# on, never crash.
+# ============================================================
+
+# mta_sts_expected_txt_for <domain>: "v=STSv1; id=<hash>" - the id is a
+# truncated sha256 of the domain's own served policy FILE content, not
+# a timestamp or random value, so it is deterministic and only changes
+# when the policy itself does - exactly what RFC 8461 requires ("id"
+# MUST change whenever the policy changes, MAY stay the same
+# otherwise). Prints nothing and returns 1 if the policy file doesn't
+# exist yet (cmd_setup always runs cmd_reconfigure first, so this
+# should not normally happen).
+mta_sts_expected_txt_for()
+{
+    local domain="$1"
+    local policy_file="${POLICY_ROOT}/${domain}/.well-known/mta-sts.txt" id
+    [[ -f "$policy_file" ]] || return 1
+    id="$(sha256sum "$policy_file" | cut -c1-20)"
+    echo "v=STSv1; id=${id}"
+}
+
+setup_mta_sts_txt()
+{
+    local dom="$1" name="_mta-sts"
+    local expected actual="" dns_out live_ttl user key_file
+
+    expected="$(mta_sts_expected_txt_for "$dom")" || { err "${name}.${dom}: no local policy file yet - this should not happen after --reconfigure."; return 1; }
+
+    if dns_out="$(resolvectl query --type=TXT "${name}.${dom}" 2>/dev/null)"; then
+        actual="$(grep -o 'v=STSv1[^"]*' <<< "$dns_out" | head -1)"
+    fi
+
+    if [[ -n "$actual" && "$actual" == "$expected" ]]; then
+        log "[ OK ] ${name}.${dom}: already matches."
+        return 0
+    fi
+
+    if ! have_transip_creds "$dom"; then
+        err "${name}.${dom}: $([[ -z "$actual" ]] && echo "no TXT record published" || echo "TXT record does not match") and no TransIP credentials are available to fix it."
+        err "  Publish as: ${name}.${dom}  TXT  \"${expected}\""
+        return 1
+    fi
+
+    require_cmd transip-dns
+    user="$(transip_user_for "$dom")"; key_file="$(transip_key_for "$dom")"
+
+    if [[ -z "$actual" ]]; then
+        log "Publishing ${name}.${dom}..."
+        transip-dns --username "$user" --key-file "$key_file" \
+            add "$dom" "$name" TXT "$expected" --ttl "$MTA_STS_DEFAULT_TTL"
+        log "[ OK ] Published ${name}.${dom}."
+        log "      TTL is ${MTA_STS_DEFAULT_TTL}s - resolvers (including this server's own"
+        log "      cache) may keep answering with no data for up to that long."
+    else
+        log "${name}.${dom} does not match - updating..."
+        live_ttl="$(transip_live_ttl_for "$dom" "$name" TXT)"
+        [[ -n "$live_ttl" ]] || die "Could not find ${name}.${dom}'s own live TTL via transip-dns list - refusing to guess one for update."
+        transip-dns --username "$user" --key-file "$key_file" \
+            update "$dom" "$name" TXT "$expected" --ttl "$live_ttl"
+        log "[ OK ] Updated ${name}.${dom}."
+        log "      TTL is ${live_ttl}s - resolvers (including this server's own cache) may"
+        log "      keep answering with the OLD value for up to that long."
+    fi
+}
+
+cmd_setup()
+{
+    require_cmd resolvectl
+
+    log "Running --reconfigure first, so the local policy/mx side is correct..."
+    cmd_reconfigure
+
+    local -a domains=()
+    while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
+    [[ "${#domains[@]}" -gt 0 ]] || die "No mta-sts.<domain> hostname resolves to this server - nothing to publish."
+
+    local d failed=0
+    for d in "${domains[@]}"; do
+        echo
+        echo "=== $d ==="
+        setup_mta_sts_txt "$d" || failed=$((failed + 1))
+    done
+
+    echo
+    if [[ "$failed" -eq 0 ]]; then
+        log "[ OK ] _mta-sts TXT published/up to date for ${#domains[@]} domain(s)."
+    else
+        err "$failed record(s) could not be published/updated automatically - see error lines above."
+        return 1
+    fi
+}
+
+# ============================================================
 # Argument parsing
 # ============================================================
 
@@ -377,6 +501,8 @@ while [[ $# -gt 0 ]]; do
             ACTION="status"; shift ;;
         --reconfigure)
             ACTION="reconfigure"; shift ;;
+        --setup)
+            ACTION="setup"; shift ;;
         -h|--help)
             show_help; exit 0 ;;
         *)
@@ -405,6 +531,9 @@ case "$ACTION" in
         ;;
     reconfigure)
         cmd_reconfigure
+        ;;
+    setup)
+        cmd_setup
         ;;
     *)
         show_help
