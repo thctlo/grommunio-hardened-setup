@@ -173,6 +173,25 @@ transip_key_for()
     grep '^dns_transip_key_file' "$ini_file" | sed 's/.*= *//'
 }
 
+# transip_live_ttl_for <domain> <name> <type>: the TTL the record
+# ACTUALLY has right now, straight from the TransIP API via `transip-dns
+# list` (not resolvectl - a resolver's cached/default TTL display can
+# disagree with the authoritative value, and `update` needs the exact
+# live one). REAL BUG FOUND 2026-11-15: the stale-TLSA update path
+# originally passed the script's own $TTL constant (3600) to `--ttl`
+# unconditionally - `transip-dns update` requires name/type/TTL to
+# match the live record exactly (TTL is not something update can
+# change, see its own --help), so this failed outright the moment the
+# live record's real TTL (300, in this case) differed from $TTL.
+transip_live_ttl_for()
+{
+    local domain="$1" name="$2" rtype="$3" user key_file
+    user="$(transip_user_for "$domain")" || return 1
+    key_file="$(transip_key_for "$domain")" || return 1
+    transip-dns --username "$user" --key-file "$key_file" list "$domain" 2>/dev/null \
+        | awk -v n="$name" -v t="$rtype" '$1 == n && $3 == t { print $2; exit }'
+}
+
 # expected_tlsa_for: "3 1 1 <hash>" computed from the CURRENT
 # certificate's public key - the value a correct TLSA record should
 # have right now. Prints nothing if the certificate doesn't exist (or
@@ -380,9 +399,12 @@ cmd_setup()
         if have_transip_creds "$domain"; then
             log "Published TLSA record is stale (${tlsa_live}) - updating to match the current certificate..."
             require_cmd transip-dns
-            local user key_file; user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
+            local user key_file live_ttl
+            user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
+            live_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
+            [[ -n "$live_ttl" ]] || die "Could not find the live TLSA record's own TTL via transip-dns list - refusing to guess one for update."
             transip-dns --username "$user" --key-file "$key_file" \
-                update "$domain" "_25._tcp.${label}" TLSA "$want_tlsa" --ttl "$TTL"
+                update "$domain" "_25._tcp.${label}" TLSA "$want_tlsa" --ttl "$live_ttl"
             log "[ OK ] Updated TLSA record: ${tlsa_live} -> ${want_tlsa}"
         else
             err "Published TLSA record is stale and no TransIP credentials are available to update it."
