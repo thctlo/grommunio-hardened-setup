@@ -385,7 +385,12 @@ only about whether a *second* source gets layered on top of it:
    one package from your local pool actually resolves from there (not
    silently shadowed by a higher community version - priority wins
    over version number here, so a stale local pool is still preferred,
-   which is itself a reason to keep it refreshed).
+   which is itself a reason to keep it refreshed). The local pool
+   directory does not need to exist or contain anything yet when you
+   pick option 2 - this step creates it (and its `pool/` subdirectory)
+   and sets up a valid, empty apt index/pin if there is nothing to
+   publish there yet; see [`custom-repo/README.md`](custom-repo/README.md)
+   for how to actually publish packages into it afterward.
 
 **Why:** this is the one step with a real choice in it - see the box
 below for when option 2 is actually useful.
@@ -591,6 +596,17 @@ plain defaults:
   `permit_sasl_authenticated` ordered first so authenticated senders
   never hit the PTR check.
 - `smtpd_helo_restrictions` += `reject_unknown_helo_hostname`.
+- `myhostname` override, only when step 10 found/was given a separate
+  `--mx-hostname`: Postfix's own HELO/EHLO/SASL-domain identity moves
+  to that dedicated hostname instead of the system/web hostname - see
+  step 10's own note on why the two are kept apart. Also writes a
+  small, dedicated nginx vhost that 301-redirects that hostname to the
+  real system/web hostname: grommunio's own nginx setup has no vhost
+  of its own (one `default_server` catch-all answers on any Host
+  header), so without this, browsing to the mx-hostname over HTTPS
+  (its own cert SAN, needed for DANE) would silently serve the full
+  grommunio-web app and fail SSO with "Invalid parameter:
+  redirect_uri" - found live 2026-11-15.
 
 Deliberately left alone (the operator's own call, not an oversight):
 `milter_default_action=accept` (fail-open if rspamd is ever
@@ -846,7 +862,16 @@ the pattern to extend it).
 wires grommunio Web into it as an OpenID Connect client - including a
 few claim-mapper and user-profile fixes the official setup scripts
 don't apply on their own (see the script's own header comments for
-exactly which ones and why, if you're curious).
+exactly which ones and why, if you're curious). Also preseeds
+`shared/grommunio/site-fqdn` to the public system/web hostname before
+installing - without it, Keycloak issues tokens/redirect URIs using
+this server's own system hostname by default, which breaks SSO the
+moment a dedicated `--mx-hostname` exists (found live 2026-11-14/15:
+Keycloak's issuer, and separately every grommunio-web/-chat/-files/
+-admin client's own `rootUrl`/redirect URIs, ended up pointing at the
+mx-hostname instead of the real public FQDN - fix this by hand via the
+Keycloak admin console per client if it ever regresses after a
+re-install or a manual client re-creation).
 
 **Why:** this is what lets every grommunio component (Web, Chat,
 Files, Archive) share one login and one place to configure per-user
@@ -877,23 +902,44 @@ MFA as available (opt-in) for that account.
   own config - the system-wide gate that gives newly created users
   the Files app at all.
 - **Fixes a real upstream bug that leaves Files completely inert
-  after the first boot**: the package's own
-  `grommunio-files-cron.timer` ships with only `OnBootSec=120` in its
-  `[Timer]` section - no repeat interval at all. Nextcloud's own
-  `cron.php` needs to run every few minutes for trash cleanup,
-  sharing, and notifications to work; with the stock unit it instead
-  runs exactly once, 2 minutes after boot, and never again. Confirmed
-  live: 3 days of total inactivity on a server that had been rebooted
-  only once in that window. Fixed with a drop-in adding
-  `OnUnitActiveSec=5min`, leaving the package's own `OnBootSec=120`
-  alone.
+  after the first boot** (on `grommunio-files` < 34.0.4-1): the
+  package's own `grommunio-files-cron.timer` used to ship with only
+  `OnBootSec=120` in its `[Timer]` section - no repeat interval at
+  all. Nextcloud's own `cron.php` needs to run every few minutes for
+  trash cleanup, sharing, and notifications to work; with that stock
+  unit it instead ran exactly once, 2 minutes after boot, and never
+  again. Confirmed live: 3 days of total inactivity on a server that
+  had been rebooted only once in that window. **Now conditional**:
+  this step checks the package's own shipped unit file directly - on
+  `>= 34.0.4-1` it already repeats natively (`OnUnitActiveSec=5min`
+  upstream now, confirmed live 2026-11-14) and no drop-in is added (an
+  earlier run's now-redundant drop-in is removed if found); only an
+  older, still-buggy package gets the `OnUnitActiveSec=5min` drop-in.
+- Fixes a real bug in the package's own postinst: it does not reliably
+  add the real public FQDN to Nextcloud's `trusted_domains` - found
+  live with a truncated, garbage entry (`"mail."` instead of
+  `"mail.<domain>"`) sitting alongside a *different*, also-present
+  entry for this server's own mx-hostname (confirmed unrelated: that
+  one is Postfix's own mail-exchange identity, never the public web
+  FQDN - see step 10/34's own notes). Nextcloud rejects every request
+  whose Host header isn't in this list with a flat 400 before auth or
+  routing even happen, so a missing/wrong entry here looks exactly
+  like a broken WebDAV/reverse-proxy setup with no useful nginx trace
+  at all. Fixed the supported way (`occ config:system:set`, never
+  hand-editing `config.php`) - adds the real FQDN if missing, but does
+  not remove any pre-existing garbage entries on its own (a stale
+  extra entry is harmless - `trusted_domains` is just an allow-list -
+  but worth cleaning up by hand with the same `occ` command if you
+  ever find one, same as was done live 2026-11-15).
 
 **Why:** the debconf hang and the `privFiles`/plugin-enable gaps are
 real, reproducible packaging gaps - the fix has to happen before/
-during install, not after. The cron-timer bug is the most consequential
-of the three: without it Files silently stops doing anything useful
-shortly after the one boot it was installed on, with no error anywhere
-to point at the cause.
+during install, not after. The cron-timer bug was the most
+consequential of the bunch while it applied: without it, Files
+silently stopped doing anything useful shortly after the one boot it
+was installed on, with no error anywhere to point at the cause. The
+`trusted_domains` bug is the one most likely to look like a completely
+unrelated problem (WebDAV/proxy) when it bites.
 
 **Result:** `https://<FQDN>/files` loads and logs in with the same
 grommunio credentials; `systemctl status php8.4-fpm` shows the
