@@ -229,21 +229,30 @@ configure_personal()
     fi
     REPO_DIR="${REPO_DIR%/}"
 
-    # Precondition: the pool must already be copied here (manual step).
+    # Bootstraps cleanly even before any package has ever been published
+    # here - creates REPO_DIR/pool (the exact layout repo-setup's
+    # publish-to-server.sh rsyncs into) if missing, and proceeds with an
+    # empty-but-valid index/pin rather than refusing to run at all.
+    # dpkg-scanpackages on an empty tree exits 0 and writes a valid,
+    # empty Packages file (confirmed live) - apt is completely happy
+    # pointing at a local source with zero packages in it. This is what
+    # makes the publish-to-server.sh + refresh-personal-repo.sh flow
+    # (repo-setup) usable from a genuinely fresh server: this step sets
+    # up the pinning infrastructure once, then later publishes just add
+    # packages into what already exists.
     if [[ ! -d "$REPO_DIR" ]]; then
-        err "Repo directory does not exist: $REPO_DIR"
-        err "Copy the package pool here first (e.g. scp -r from the build host's /srv/apt-repo/pool), then re-run this step."
-        return 1
+        mkdir -p "$REPO_DIR/pool"
+        log "Created $REPO_DIR (and $REPO_DIR/pool) - did not exist yet."
     fi
 
     local deb_count
     deb_count="$(find "$REPO_DIR" -name '*.deb' 2>/dev/null | wc -l)"
     if [[ "$deb_count" -eq 0 ]]; then
-        err "No .deb files found under $REPO_DIR."
-        err "Copy the package pool here first (e.g. scp -r from the build host's /srv/apt-repo/pool), then re-run this step."
-        return 1
+        log "No .deb files under $REPO_DIR yet - continuing with an empty-but-valid index."
+        log "Publish packages here later with repo-setup's publish-to-server.sh, then refresh-personal-repo.sh."
+    else
+        log "Found $deb_count .deb file(s) under $REPO_DIR."
     fi
-    log "Found $deb_count .deb file(s) under $REPO_DIR."
 
     if ! command -v dpkg-scanpackages >/dev/null 2>&1; then
         log "Installing dpkg-dev (provides dpkg-scanpackages)..."
@@ -369,13 +378,17 @@ EOF
     fi
 
     echo
-    log "Verifying the local pool's own packages are preferred over community..."
-    if [[ -n "$sample_pkg" ]] && pkg_candidate_source "$sample_pkg" | grep -qF "file:${REPO_DIR}"; then
-        log "OK: $sample_pkg's candidate comes from the local pool (file://${REPO_DIR}), confirming the pin works."
+    if [[ -z "$sample_pkg" ]]; then
+        log "No package in $REPO_DIR yet to verify the pin against - that's expected on a fresh, empty repo. Nothing to check here until something is published."
     else
-        err "Could not confirm a local-pool package ($sample_pkg) is actually preferred over community."
-        err "Check apt-cache policy $sample_pkg by hand, and that $PERSONAL_PIN_FILE was applied."
-        die "Pin verification failed."
+        log "Verifying the local pool's own packages are preferred over community..."
+        if pkg_candidate_source "$sample_pkg" | grep -qF "file:${REPO_DIR}"; then
+            log "OK: $sample_pkg's candidate comes from the local pool (file://${REPO_DIR}), confirming the pin works."
+        else
+            err "Could not confirm a local-pool package ($sample_pkg) is actually preferred over community."
+            err "Check apt-cache policy $sample_pkg by hand, and that $PERSONAL_PIN_FILE was applied."
+            die "Pin verification failed."
+        fi
     fi
 
     save_cfg "$CFG" "PKG_SOURCE=$PKG_SOURCE" "REPO_DIR=$REPO_DIR"
