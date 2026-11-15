@@ -16,10 +16,13 @@
 #                                  records file.
 #   manage-dkim.sh -domain <name>  Same, but only for this one domain (must already
 #                                  be an active grommunio domain).
-#   manage-dkim.sh --validate      Check, for every domain that already has a local
+#   manage-dkim.sh --status        Check, for every domain that already has a local
 #                                  key, whether DNS actually publishes the matching
 #                                  dkim-ed, dkim-rsa and dkim (CNAME) records.
-#   manage-dkim.sh --setup         Like --validate, but also PUBLISHES/UPDATES
+#                                  Read-only, changes nothing. (--validate is a
+#                                  kept alias, same naming as manage-certs.sh/
+#                                  manage-mta-sts.sh's own --status.)
+#   manage-dkim.sh --setup         Like --status, but also PUBLISHES/UPDATES
 #                                  whatever it finds missing or wrong, via the
 #                                  TransIP API (TransIP only - see below) -
 #                                  for every domain that already has a local key.
@@ -75,7 +78,7 @@ DKIM_DEFAULT_TTL=300
 
 show_help()
 {
-    sed -n '3,51p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,54p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # make_dkim_key <domain> <selector> <type> [bits]: creates one key, keeps an existing one
@@ -447,7 +450,7 @@ while [[ $# -gt 0 ]]; do
         -domain)
             [[ -n "${2:-}" ]] || die "-domain needs a value."
             ACTION="domain"; TARGET_DOMAIN="$2"; shift 2 ;;
-        --validate)
+        --status|--validate)
             ACTION="validate"; shift ;;
         --setup)
             ACTION="setup"; shift ;;
