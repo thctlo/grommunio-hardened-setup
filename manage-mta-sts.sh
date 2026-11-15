@@ -75,6 +75,18 @@
 #                                    exactly as they are (an enforce-mode
 #                                    promotion, or a hand-tuned max_age,
 #                                    survives).
+#   manage-mta-sts.sh -domain <name> --enforce
+#                                    Promotes just this one domain's own
+#                                    policy file from "testing" to
+#                                    "enforce", preserving mx/max_age
+#                                    exactly. -domain must come BEFORE
+#                                    --enforce (this script's own -domain
+#                                    also sets an action by itself - a
+#                                    later flag always wins). Only a
+#                                    local file change - re-run --setup
+#                                    afterward to publish the refreshed
+#                                    _mta-sts TXT id so remote senders
+#                                    notice the switch.
 #   manage-mta-sts.sh --setup        Runs --reconfigure first (so the local
 #                                    policy file/nginx side is correct),
 #                                    then PUBLISHES/UPDATES each domain's
@@ -131,7 +143,7 @@ MTA_STS_DEFAULT_TTL=300
 
 show_help()
 {
-    sed -n '3,109p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,121p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 resolves_here()
@@ -335,6 +347,44 @@ cmd_reconfigure()
     else
         log "[ OK ] Nothing needed fixing."
     fi
+}
+
+# ============================================================
+# cmd_enforce <domain>: promote one domain's own policy file from
+# "testing" to "enforce", preserving mx/max_age exactly - the one
+# deliberate, single-domain switch cmd_generate/cmd_reconfigure never
+# make on their own (they always write/keep "testing" for anything
+# they touch). A domain's own policy "id" (mta_sts_expected_txt_for(),
+# used by --setup) is a hash of the policy FILE's content, so changing
+# mode here also changes the id the next time --setup runs - that is
+# what tells remote senders to re-fetch and notice the switch.
+# ============================================================
+
+cmd_enforce()
+{
+    local domain="$1" policy_file mode mx max_age
+    [[ -n "$domain" ]] || die "-domain <name> is required for --enforce."
+    policy_file="${POLICY_ROOT}/${domain}/.well-known/mta-sts.txt"
+    [[ -f "$policy_file" ]] || die "$policy_file does not exist yet - run manage-mta-sts.sh -domain ${domain} first."
+
+    mode="$(grep -E '^mode:' "$policy_file" | awk '{print $2}')"
+    mx="$(grep -E '^mx:' "$policy_file" | awk '{print $2}')"
+    max_age="$(grep -E '^max_age:' "$policy_file" | awk '{print $2}')"
+    [[ -n "$mx" ]] || die "$policy_file has no mx: line - something is wrong with it, fix by hand first."
+    max_age="${max_age:-$DEFAULT_MAX_AGE}"
+
+    if [[ "$mode" == "enforce" ]]; then
+        log "[ OK ] $domain: $policy_file is already in enforce mode."
+        return 0
+    fi
+
+    backup_file "$policy_file"
+    printf 'version: STSv1\nmode: enforce\nmx: %s\nmax_age: %s\n' "$mx" "$max_age" > "$policy_file"
+    chmod 0644 "$policy_file"
+    finalize_backup "$policy_file"
+    log "[ OK ] $domain: $policy_file switched to enforce mode (mx: $mx, max_age: $max_age preserved)."
+    log "      The policy's own id changes with its content - run --setup to publish the"
+    log "      refreshed _mta-sts TXT record so remote senders detect the switch."
 }
 
 # ============================================================
@@ -564,6 +614,8 @@ while [[ $# -gt 0 ]]; do
             ACTION="status"; shift ;;
         --reconfigure)
             ACTION="reconfigure"; shift ;;
+        --enforce)
+            ACTION="enforce"; shift ;;
         --setup)
             ACTION="setup"; shift ;;
         --report)
@@ -606,6 +658,10 @@ run_action()
             ;;
         reconfigure)
             cmd_reconfigure
+            ;;
+        enforce)
+            [[ -n "$TARGET_DOMAIN" ]] || die "--enforce requires -domain <name>."
+            cmd_enforce "$TARGET_DOMAIN"
             ;;
         setup)
             cmd_setup
