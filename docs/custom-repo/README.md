@@ -58,8 +58,46 @@ orchestration layer for building/publishing these, kept separate from
 this one since it's about *maintaining* packages, not installing a
 server.)
 
-Then, on the build host, publish the pool to the mail server over SSH
-(no manual `scp -r` needed - `repo-setup`'s own
+**The FIRST time** (even before publishing anything), set up the
+pinning infrastructure on the mail server by running **Step 25**'s
+`configure_personal` directly, choosing **option 2**. Running it this
+way - not through `server-setup.sh`'s `START_AT=` - matters:
+`START_AT=25` runs every step from 25 to the end, which would
+re-trigger the grommunio-setup wizard, domain creation, chat, Keycloak
+and everything else all over again. Calling the step's own function
+directly runs only this one step:
+
+```
+cd /root/bin
+# If an earlier run already saved "community", delete the saved
+# config first, or step 25 just replays that choice without asking:
+rm -f /root/cfg-server/25-apt-repo-personal.conf
+source functions/00-common.sh
+source functions/25-apt-repo-personal.sh
+step_apt_repo_personal
+```
+
+Choose **option 2** and confirm the directory (`/srv/apt-repo` by
+default, same path as the build host's own `APT_BASEDIR` - matching
+on purpose, so `publish-to-server.sh` below needs no override). The
+directory does not need to exist yet, or contain anything - this step
+creates it (and its `pool/` subdirectory, the exact layout
+`publish-to-server.sh` rsyncs into) and sets up a perfectly valid,
+empty apt index/pin if there is nothing to publish yet. That one step
+does everything else: generates the package index, adds the local
+repo as a second apt source, and writes an APT preferences file
+pinning it above community (`Pin: release o=personal-build`, priority
+900 - matching a unique `Origin:` this repo's own generated `Release`
+file sets, not a bare "local source" match, which turned out to also
+match Debian's own base/backports sources when configured via a
+`mirror+file://` URI). Priority, not version number, decides the
+winner: a package present in both resolves from your local pool even
+if community's copy has a higher version number - intentional, since
+your own pool is a manual copy that can otherwise go stale unnoticed.
+
+Then, every time there's something new to publish: on the build host,
+send the pool to the mail server over SSH (no manual `scp -r` needed -
+`repo-setup`'s own
 [`publish-to-server.sh`](https://github.com/thctlo/repo-setup/blob/main/scripts/publish-to-server.sh)
 rsyncs it there):
 
@@ -71,24 +109,10 @@ rsyncs it there):
 non-interactive - a plain `ssh-copy-id` from the build host's own
 `builder` user is all it takes, once.)
 
-The FIRST time, run **Step 25**
-(`functions/25-apt-repo-personal.sh`) on the mail server itself,
-choosing **option 2** - pointing it at that directory when asked. That
-one step does everything else: generates the package index, adds the
-local repo as a second apt source, and writes an APT preferences file
-pinning it above community (`Pin: release o=personal-build`, priority
-900 - matching a unique `Origin:` this repo's own generated `Release`
-file sets, not a bare "local source" match, which turned out to also
-match Debian's own base/backports sources when configured via a
-`mirror+file://` URI). Priority, not version number, decides the
-winner: a package present in both resolves from your local pool even
-if community's copy has a higher version number - intentional, since
-your own pool is a manual copy that can otherwise go stale unnoticed.
-
-From then on, after any further `publish-to-server.sh` run, just
-refresh the index with this project's own standalone
+Then, back on the mail server, pick up what was just published with
+this project's own standalone
 [`refresh-personal-repo.sh`](../../refresh-personal-repo.sh) - no need
-to go through Step 25/server-setup.sh again:
+to go through Step 25/server-setup.sh again for this part:
 
 ```
 sudo ./refresh-personal-repo.sh
