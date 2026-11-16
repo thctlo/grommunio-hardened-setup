@@ -182,9 +182,10 @@ publish_one_tlsa()
     local domain="$1" record_name="$2" user="$3" key_file="$4" usage_prefix="$5" new_rrdata="$6"
     [[ -n "$new_rrdata" ]] || return 0
 
-    local current_line current_rrdata current_ttl
-    current_line="$(transip-dns --username "$user" --key-file "$key_file" list "$domain" 2>/dev/null \
-        | awk -v n="$record_name" -v u="$usage_prefix" '$1==n && $3=="TLSA" && $4==u')"
+    local all_lines current_line current_rrdata current_ttl
+    all_lines="$(transip-dns --username "$user" --key-file "$key_file" list "$domain" 2>/dev/null \
+        | awk -v n="$record_name" '$1==n && $3=="TLSA"')"
+    current_line="$(awk -v u="$usage_prefix" '$4==u' <<< "$all_lines")"
     current_rrdata="$(echo "$current_line" | sed -E 's/^\S+\s+\S+\s+\S+\s+//')"
     current_ttl="$(echo "$current_line" | awk '{print $2}')"
 
@@ -202,9 +203,23 @@ publish_one_tlsa()
         fi
         log "[ OK ] TLSA (${usage_prefix} x x) record updated for ${record_name}.${domain}."
     else
+        # REAL BUG FOUND 2026-11-16: a SIBLING TLSA entry (the other
+        # usage-type) can already exist at this exact name - TransIP
+        # requires every record in that rrset to share one TTL, so
+        # adding this one with the fixed $TTL default fails outright
+        # (406 "the expire of all records in an rrset must be all the
+        # same") whenever that sibling's own live TTL differs. Use the
+        # sibling's live TTL (already have it in all_lines) when one
+        # exists, $TTL only when this is truly the first TLSA record.
+        local add_ttl="$TTL"
+        if [[ -n "$all_lines" ]]; then
+            local sibling_ttl
+            sibling_ttl="$(awk '{print $2; exit}' <<< "$all_lines")"
+            [[ -n "$sibling_ttl" ]] && add_ttl="$sibling_ttl"
+        fi
         log "Publishing new TLSA (${usage_prefix} x x) rrdata for ${record_name}.${domain}: ${new_rrdata}"
         if ! transip-dns --username "$user" --key-file "$key_file" \
-            add "$domain" "$record_name" TLSA "$new_rrdata" --ttl "$TTL"; then
+            add "$domain" "$record_name" TLSA "$new_rrdata" --ttl "$add_ttl"; then
             log "[ERROR] Could not add the new TLSA (${usage_prefix} x x) record for ${record_name}.${domain}."
             return 1
         fi

@@ -383,9 +383,10 @@ cmd_setup()
     publish_tlsa_entry()
     {
         local usage_prefix="$1" description="$2" want_value="$3"
-        local live="" out
+        local live="" out all_lines=""
         if out="$(resolvectl query --type=TLSA "_25._tcp.${target}" 2>/dev/null)"; then
-            live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | grep -E "^${usage_prefix} " | head -1 || true)"
+            all_lines="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" || true)"
+            live="$(grep -E "^${usage_prefix} " <<< "$all_lines" | head -1 || true)"
         fi
         [[ -n "$want_value" ]] || die "Could not compute the expected ${description} value - refusing to publish."
 
@@ -394,10 +395,33 @@ cmd_setup()
                 log "Computing and publishing the initial ${description} record..."
                 require_cmd transip-dns
                 local user key_file; user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
-                transip-dns --username "$user" --key-file "$key_file" \
-                    add "$domain" "_25._tcp.${label}" TLSA "$want_value" --ttl "$TTL"
+                # REAL BUG FOUND 2026-11-16: a SIBLING TLSA entry (the
+                # other usage-type) can already exist at this exact
+                # name - TransIP requires every record in that rrset to
+                # share one TTL, so adding this one with the script's
+                # own fixed $TTL default fails outright (406 "the
+                # expire of all records in an rrset must be all the
+                # same") whenever that sibling's own live TTL differs.
+                # Use the sibling's live TTL when one exists, $TTL only
+                # when this is truly the first TLSA record at this name.
+                local add_ttl="$TTL"
+                if [[ -n "$all_lines" ]]; then
+                    local sibling_ttl
+                    sibling_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
+                    [[ -n "$sibling_ttl" ]] && add_ttl="$sibling_ttl"
+                fi
+                # Also found in the same incident: this add's own exit
+                # status was never checked, so a failed add (like the
+                # TTL-mismatch 406 above) was still reported "[ OK ]
+                # Published" - confirmed live by a --status run right
+                # after showing the record was never actually there.
+                if ! transip-dns --username "$user" --key-file "$key_file" \
+                    add "$domain" "_25._tcp.${label}" TLSA "$want_value" --ttl "$add_ttl"; then
+                    err "Could not add the new ${description} record for _25._tcp.${target}."
+                    return 1
+                fi
                 log "[ OK ] Published ${description}: ${want_value}"
-                log "      TTL is ${TTL}s - resolvers (including this server's own cache) may keep"
+                log "      TTL is ${add_ttl}s - resolvers (including this server's own cache) may keep"
                 log "      answering with no/old data for up to that long. A --status run inside"
                 log "      this window can still show [FAIL] even though the record is correct."
             else
