@@ -90,6 +90,14 @@ ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDS
 ssl_ecdh_curve X25519MLKEM768:X25519:secp384r1:secp256r1;
 # TLS 1.3: 256-bit suites only.
 ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256;
+# Block SHA-1 as a TLS1.2 signature algorithm (2026-11-16), same
+# defense-in-depth hardening and same exact list as Postfix's own
+# tls_config_file (34-postfix-tls.sh) - RFC 9155 discourages SHA-1 here.
+# Multiple ssl_conf_command directives for different commands are fine
+# (confirmed live via nginx -t: Ciphersuites + SignatureAlgorithms
+# together, no conflict) - this is not the same restriction as
+# scalar directives like ssl_ciphers/ssl_protocols, which allow only one.
+ssl_conf_command SignatureAlgorithms ECDSA+SHA512:ECDSA+SHA384:ECDSA+SHA256:RSA-PSS+SHA512:RSA-PSS+SHA384:RSA-PSS+SHA256:RSA+SHA512:RSA+SHA384:RSA+SHA256;
 CONF
 if ! cmp -s "$TLS_NEW" "$TLS_CFG"; then
     backup_file "$TLS_CFG"
@@ -102,6 +110,31 @@ else
     log "[ OK ] $TLS_CFG already correct."
 fi
 rm -f "$TLS_NEW"
+
+# nginx.conf's own shipped default ("don't force server cipher order")
+# leaves the CLIENT's cipher preference in charge. Found 2026-11-16: the
+# two vhosts that matter - grommunio-web's own catch-all and admin-web -
+# already override this back to "on" in their own server blocks
+# (ssl_params.conf / nginx-ssl-params.conf, same-block includes,
+# confirmed via `nginx -T`), so grommunio's own behavior is unaffected
+# either way. Only our own smaller vhosts (the mta-sts policy hosts, the
+# mx-hostname redirect) had no such override and silently inherited this
+# weaker global default. Fixed directly in nginx.conf (self-healing, same
+# pattern as the admin-web package file below) - conf.d/*.conf is
+# included at the same http scope as this file, so a second
+# ssl_prefer_server_ciphers directive there would be rejected outright as
+# a duplicate (same reasoning as the comment above $TLS_CFG's own write).
+local NGINX_CONF="/etc/nginx/nginx.conf"
+if grep -q '^\s*ssl_prefer_server_ciphers off;' "$NGINX_CONF"; then
+    backup_file "$NGINX_CONF"
+    sed -i 's/^\(\s*\)ssl_prefer_server_ciphers off;.*/\1ssl_prefer_server_ciphers on;/' "$NGINX_CONF"
+    finalize_backup "$NGINX_CONF"
+    nginx -t >/dev/null 2>&1 || die "nginx config test fails after setting ssl_prefer_server_ciphers on in $NGINX_CONF - restore from the .bak file just written."
+    systemctl reload nginx
+    log "[ OK ] Set ssl_prefer_server_ciphers = on in $NGINX_CONF (was off - only affected vhosts without their own override, e.g. the mta-sts/mx-hostname-redirect ones)."
+else
+    log "[ OK ] $NGINX_CONF's ssl_prefer_server_ciphers is not 'off' (already on, or already fixed)."
+fi
 
 # REAL GAP FOUND AND FIXED 2026-10-23: admin-web (port 8443) did not use the
 # ssl_ciphers/ssl_protocols above at all - grommunio-admin-common ships its
