@@ -26,8 +26,9 @@
 # what's actually still wrong - never a blind overwrite of the whole
 # restriction list, in case it's been customized further by hand since.
 #
-# Deliberately NOT touched here, left as-is (user's own call 2026-10-22):
-# milter_default_action=accept (fail-open if rspamd is ever unreachable).
+# milter_default_action: left at accept (user's own call 2026-10-22) until
+# 2026-11-16, when the user switched it to tempfail instead - see
+# 38-antispam.sh (where it's actually set) for the current reasoning.
 #
 # Second round, same day: diffed against the user's own long-running
 # Debian 7 production main.cf (a different, older mail server the user runs).
@@ -123,6 +124,20 @@ local -A POSTFIX_HARDENING_SCALARS=(
     [message_size_limit]=157286400
     [strict_rfc821_envelopes]=yes
     [delay_warning_time]=4h
+    # postscreen_pipelining_enable/non_smtp_command_enable/bare_newline_enable:
+    # Postfix's own compiled-in default is "yes" for all three (never set by
+    # this project before - found live 2026-11-16 as a diff against that
+    # default, not something we had chosen). Set to "no" because the user
+    # found these early-talker checks were causing a greylisting-like effect
+    # on real mail (legitimate senders occasionally tripped one of these
+    # checks and got delayed/rejected). The default here is "no" - if these
+    # are ever turned back to "yes", postscreen's other related checks (e.g.
+    # postscreen_dnsbl_*, postscreen_greet_*) that depend on them being on
+    # will also start acting again, so re-enabling is an all-or-nothing
+    # decision, not just these three in isolation.
+    [postscreen_pipelining_enable]=no
+    [postscreen_non_smtp_command_enable]=no
+    [postscreen_bare_newline_enable]=no
 )
 
 local param want have

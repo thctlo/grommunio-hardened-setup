@@ -24,6 +24,7 @@
 
 POSTFIX_TLS_CERT="/etc/grommunio-common/ssl/server-bundle.pem"
 POSTFIX_TLS_KEY="/etc/grommunio-common/ssl/server.key"
+POSTFIX_TLS_CONFIG_FILE="/etc/postfix/tls_config.conf"
 
 step_postfix_tls()
 {
@@ -214,17 +215,25 @@ local -A TLS_HARDENING=(
     [smtpd_tls_mandatory_protocols]=">=TLSv1.2"
     [smtpd_tls_ciphers]="high"
     [smtpd_tls_mandatory_ciphers]="high"
-    [smtpd_tls_exclude_ciphers]="aNULL, CBC"
-    # smtpd_tls_mandatory_exclude_ciphers and both smtp_tls_* (outbound/
-    # client) equivalents were missing entirely until 2026-10-30 - found
-    # while reviewing the full settings list during the SHA-1 investigation:
-    # only the plain smtpd_tls_exclude_ciphers above had ever been set,
-    # leaving postfix's OWN outgoing connections (sending mail out) with
-    # no CBC exclusion at all, and the server side's "mandatory" tier
-    # unprotected too.
-    [smtpd_tls_mandatory_exclude_ciphers]="aNULL, CBC"
-    [smtp_tls_exclude_ciphers]="aNULL, CBC"
-    [smtp_tls_mandatory_exclude_ciphers]="aNULL, CBC"
+    # REVISED 2026-11-16: the per-direction exclude_ciphers blacklist
+    # approach (aNULL/CBC excluded, everything else in OpenSSL's own
+    # "HIGH" grade allowed) is replaced by tls_high_cipherlist - an
+    # explicit WHITELIST of only modern AEAD cipher suites (ECDHE key
+    # exchange for forward secrecy, AES-GCM/ChaCha20-Poly1305 only, no
+    # CBC-mode ciphers at all). "high" + this list applies to all of
+    # smtpd_tls_ciphers/smtpd_tls_mandatory_ciphers at once - the old
+    # smtp_tls_*/smtpd_tls_*mandatory_exclude_ciphers entries are gone,
+    # not just redundant, since excluding from "high" no longer matters
+    # once "high" itself is this exact list.
+    [tls_high_cipherlist]="ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
+    # The server's own cipher order wins over the client's offered order.
+    [tls_preempt_cipherlist]="yes"
+    # tls_config_file/tls_config_name (2026-11-16): Postfix's own native
+    # OpenSSL SSL_CONF_cmd mechanism (available since Postfix reads this
+    # file directly itself) - see the "SignatureAlgorithms" section below
+    # for what it replaces.
+    [tls_config_file]="${POSTFIX_TLS_CONFIG_FILE}"
+    [tls_config_name]="postfix"
     # 1, not Postfix's own default 0: logs one summary line per
     # connection (protocol, cipher, key-exchange, signature) - enough to
     # spot a real compatibility problem (found live 2026-11-12/13 during
@@ -255,95 +264,103 @@ if [[ "$TLS_HARDENING_CHANGED" -eq 1 ]]; then
 fi
 
 # ============================================================
-# Block SHA-1 as a TLS1.2 signature algorithm (2026-10-30) - prompted by
-# an external mail-security scan report flagging "Server accepts SHA-1 as
-# hash function for the digital signature during key exchange" (RFC 9155
-# discourages this). Live testing found this server's OpenSSL 3.5.7 build
-# ALREADY refuses a SHA-1-only signature_algorithms offer by default (its
-# own SECLEVEL policy) and always picks SHA-256+ over SHA-1 even in a
-# mixed offer - so this is NOT a fix for an active weakness, just
-# explicit, defense-in-depth hardening against a future OpenSSL/config
-# change silently relaxing that default.
+# Block SHA-1 as a TLS1.2 signature algorithm (2026-10-30, revised
+# 2026-11-16) - prompted by an external mail-security scan report
+# flagging "Server accepts SHA-1 as hash function for the digital
+# signature during key exchange" (RFC 9155 discourages this). Live
+# testing found this server's OpenSSL 3.5.7 build ALREADY refuses a
+# SHA-1-only signature_algorithms offer by default (its own SECLEVEL
+# policy) and always picks SHA-256+ over SHA-1 even in a mixed offer -
+# so this is NOT a fix for an active weakness, just explicit,
+# defense-in-depth hardening against a future OpenSSL/config change
+# silently relaxing that default.
 #
-# Postfix has no native parameter for this (confirmed:
-# `postconf -d | grep -i sigalg` returns nothing) - the mechanism is the
-# same one gromox-imap/-pop3 already use for their own CBC-cipher
-# exclusion (`openssl-noncbc.cnf` + a systemd Environment=OPENSSL_CONF=
-# override, confirmed by reading their actual .service.d/override.conf
-# files, not assumed): a dedicated, service-scoped OpenSSL config file.
+# REVISED 2026-11-16: originally implemented the same way gromox-imap/
+# -pop3 do their own CBC-cipher exclusion (a dedicated openssl.cnf + a
+# systemd Environment=OPENSSL_CONF= override + preserving OPENSSL_CONF
+# through postfix's own import_environment whitelist - three moving
+# parts, already found fragile live once on 2026-11-04 when postfix's
+# own environment sanitizing silently dropped it on every restart).
+# tls_config_file/tls_config_name (set in TLS_HARDENING above) is
+# Postfix's own NATIVE SSL_CONF_cmd mechanism - postfix reads this file
+# directly itself, with no OPENSSL_CONF environment variable, no
+# systemd override, and no import_environment entry needed at all.
+# Also widened to include RSA-PSS (a separate, modern signature scheme
+# from plain RSA/PKCS1 - different TLS peers may negotiate either one),
+# found missing from the original list on review.
+#
 # `SignatureAlgorithms` (not `CipherString`) is the config-file key for
 # this - confirmed both from OpenSSL's own SSL_CONF_cmd docs and by a live
 # discriminating test (a temporary openssl s_server restricted to
 # ECDSA+SHA384 only correctly refused a SHA256 offer, which default
 # OpenSSL always accepts - proving the directive is actually parsed and
 # enforced, not a silently-ignored no-op).
-POSTFIX_OPENSSL_CONF="/etc/postfix/openssl-nosha1.cnf"
-POSTFIX_SYSTEMD_OVERRIDE_DIR="/etc/systemd/system/postfix.service.d"
-POSTFIX_SYSTEMD_OVERRIDE="${POSTFIX_SYSTEMD_OVERRIDE_DIR}/override.conf"
+TLS_CONFIG_WANT='postfix = postfix_settings
 
-SHA1_CONF_WANT='openssl_conf = openssl_init
+[postfix_settings]
+ssl_conf = postfix_ssl_settings
 
-[openssl_init]
-ssl_conf = ssl_module
+[postfix_ssl_settings]
+system_default = postfix_tls_defaults
 
-[ssl_module]
-system_default = system_default_sect
-
-[system_default_sect]
-SignatureAlgorithms = ECDSA+SHA512:ECDSA+SHA384:ECDSA+SHA256:RSA+SHA512:RSA+SHA384:RSA+SHA256
+[postfix_tls_defaults]
+SignatureAlgorithms = ECDSA+SHA512:ECDSA+SHA384:ECDSA+SHA256:RSA-PSS+SHA512:RSA-PSS+SHA384:RSA-PSS+SHA256:RSA+SHA512:RSA+SHA384:RSA+SHA256
 '
-SHA1_OVERRIDE_WANT="[Service]
-Environment=OPENSSL_CONF=${POSTFIX_OPENSSL_CONF}
-"
 
 sha1_changed=0
 
-if [[ -f "$POSTFIX_OPENSSL_CONF" ]] && cmp -s <(printf '%s' "$SHA1_CONF_WANT") "$POSTFIX_OPENSSL_CONF"; then
-    log "[ OK ] ${POSTFIX_OPENSSL_CONF} already up to date."
+if [[ -f "$POSTFIX_TLS_CONFIG_FILE" ]] && cmp -s <(printf '%s' "$TLS_CONFIG_WANT") "$POSTFIX_TLS_CONFIG_FILE"; then
+    log "[ OK ] ${POSTFIX_TLS_CONFIG_FILE} already up to date."
 else
-    backup_file "$POSTFIX_OPENSSL_CONF"
-    printf '%s' "$SHA1_CONF_WANT" > "$POSTFIX_OPENSSL_CONF"
-    finalize_backup "$POSTFIX_OPENSSL_CONF"
+    backup_file "$POSTFIX_TLS_CONFIG_FILE"
+    printf '%s' "$TLS_CONFIG_WANT" > "$POSTFIX_TLS_CONFIG_FILE"
+    finalize_backup "$POSTFIX_TLS_CONFIG_FILE"
     sha1_changed=1
-    log "[ OK ] Wrote ${POSTFIX_OPENSSL_CONF}."
+    log "[ OK ] Wrote ${POSTFIX_TLS_CONFIG_FILE}."
 fi
 
-mkdir -p "$POSTFIX_SYSTEMD_OVERRIDE_DIR"
-if [[ -f "$POSTFIX_SYSTEMD_OVERRIDE" ]] && cmp -s <(printf '%s' "$SHA1_OVERRIDE_WANT") "$POSTFIX_SYSTEMD_OVERRIDE"; then
-    log "[ OK ] ${POSTFIX_SYSTEMD_OVERRIDE} already up to date."
-else
-    backup_file "$POSTFIX_SYSTEMD_OVERRIDE"
-    printf '%s' "$SHA1_OVERRIDE_WANT" > "$POSTFIX_SYSTEMD_OVERRIDE"
-    finalize_backup "$POSTFIX_SYSTEMD_OVERRIDE"
+# One-time cleanup of the old OPENSSL_CONF-based mechanism this
+# replaces - left stale otherwise, and confusing to find during future
+# debugging (confirmed live 2026-11-16: the old openssl-nosha1.cnf file
+# was already gone, but the systemd override and the import_environment
+# entry pointing at it both still remained).
+OLD_POSTFIX_OPENSSL_CONF="/etc/postfix/openssl-nosha1.cnf"
+OLD_POSTFIX_SYSTEMD_OVERRIDE="/etc/systemd/system/postfix.service.d/override.conf"
+if [[ -f "$OLD_POSTFIX_OPENSSL_CONF" ]]; then
+    backup_file "$OLD_POSTFIX_OPENSSL_CONF"
+    rm -f "$OLD_POSTFIX_OPENSSL_CONF"
     sha1_changed=1
-    log "[ OK ] Wrote ${POSTFIX_SYSTEMD_OVERRIDE} (OPENSSL_CONF scoped to postfix only)."
+    log "[ OK ] Removed obsolete ${OLD_POSTFIX_OPENSSL_CONF} (superseded by tls_config_file)."
+fi
+if [[ -f "$OLD_POSTFIX_SYSTEMD_OVERRIDE" ]] && grep -q 'OPENSSL_CONF' "$OLD_POSTFIX_SYSTEMD_OVERRIDE"; then
+    backup_file "$OLD_POSTFIX_SYSTEMD_OVERRIDE"
+    rm -f "$OLD_POSTFIX_SYSTEMD_OVERRIDE"
+    sha1_changed=1
+    log "[ OK ] Removed obsolete ${OLD_POSTFIX_SYSTEMD_OVERRIDE} (superseded by tls_config_file)."
 fi
 
-# Found 2026-11-04 (a `systemctl show postfix -p Environment` looked
-# right, but /proc/<master-pid>/environ genuinely lacked OPENSSL_CONF):
-# postfix's own master process sanitizes its environment down to
-# import_environment's whitelist on every start, discarding anything
-# else systemd handed it - the systemd Environment= override above is
-# necessary but not sufficient, postfix must also be told to keep this
-# one. Without this, the SignatureAlgorithms exclusion silently never
-# reached tlsproxy at all, on any restart, since this was first set up -
-# confirmed by directly reading tlsproxy's own /proc/<pid>/environ.
 CURRENT_IMPORT_ENV="$(postconf -h import_environment)"
-if ! grep -qw 'OPENSSL_CONF' <<< "$CURRENT_IMPORT_ENV"; then
+if grep -qw 'OPENSSL_CONF' <<< "$CURRENT_IMPORT_ENV"; then
     backup_file /etc/postfix/main.cf
-    postconf -e "import_environment = ${CURRENT_IMPORT_ENV} OPENSSL_CONF" \
-        || die "Could not add OPENSSL_CONF to postfix's import_environment."
+    read -ra _import_env_tokens <<< "$CURRENT_IMPORT_ENV"
+    NEW_IMPORT_ENV=""
+    for _tok in "${_import_env_tokens[@]}"; do
+        [[ "$_tok" == "OPENSSL_CONF" ]] && continue
+        NEW_IMPORT_ENV="${NEW_IMPORT_ENV:+$NEW_IMPORT_ENV }${_tok}"
+    done
+    postconf -e "import_environment = ${NEW_IMPORT_ENV}" \
+        || die "Could not remove OPENSSL_CONF from postfix's import_environment."
     finalize_backup /etc/postfix/main.cf
     sha1_changed=1
-    log "[ OK ] Added OPENSSL_CONF to postfix's import_environment."
+    log "[ OK ] Removed obsolete OPENSSL_CONF from postfix's import_environment (was: '${CURRENT_IMPORT_ENV}')."
 else
-    log "[ OK ] OPENSSL_CONF already in postfix's import_environment."
+    log "[ OK ] postfix's import_environment does not have OPENSSL_CONF (nothing to remove)."
 fi
 
 if [[ "$sha1_changed" -eq 1 ]]; then
-    systemctl daemon-reload || die "systemctl daemon-reload failed after the SignatureAlgorithms override."
-    systemctl restart postfix || die "postfix did not restart after the SignatureAlgorithms override."
-    log "[ OK ] postfix restarted with the SHA-1 signature-algorithm exclusion."
+    systemctl daemon-reload || die "systemctl daemon-reload failed after the TLS config-file change."
+    systemctl restart postfix || die "postfix did not restart after the TLS config-file change."
+    log "[ OK ] postfix restarted with the native tls_config_file-based signature-algorithm policy."
 fi
 
 # Verify live: a SHA-1-only offer must fail, a SHA-256 offer must still work.

@@ -38,9 +38,14 @@
 #   - checks the rspamd config and that a test message gets both signatures
 #   - writes the DNS records to /root/cfg-server/dkim-dns-records.txt
 #
-# Port 11332 is the rspamd milter (grommunio-setup's value). Mail that rspamd
-# cannot scan is accepted (milter_default_action=accept), so a broken rspamd
-# does not stop mail flow.
+# Port 11332 is the rspamd milter (grommunio-setup's value).
+#
+# milter_default_action was accept (fail-open: mail that rspamd cannot scan
+# is still accepted unfiltered) until 2026-11-16, the user's own deliberate
+# choice at the time (see the superseded note this replaced in
+# 34-postfix-hardening.sh). Switched to tempfail (fail-closed: mail is
+# deferred, not dropped, for the sender to retry later) - a rspamd outage now
+# safely queues mail instead of letting it through with zero spam filtering.
 
 RSPAMD_MILTER="inet:localhost:11332"
 RSPAMD_DKIM_DIR="/var/lib/rspamd/dkim"
@@ -732,7 +737,7 @@ rm -f "$RD_NEW"
 
 # 2. Postfix milter settings
 local pair key want cur
-for pair in "smtpd_milters=$RSPAMD_MILTER" "non_smtpd_milters=$RSPAMD_MILTER" "milter_default_action=accept" "milter_protocol=6"; do
+for pair in "smtpd_milters=$RSPAMD_MILTER" "non_smtpd_milters=$RSPAMD_MILTER" "milter_default_action=tempfail" "milter_protocol=6"; do
     key="${pair%%=*}"; want="${pair#*=}"
     cur="$(postconf -h "$key" 2>/dev/null)"
     if [[ "$cur" != "$want" ]]; then
