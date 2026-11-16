@@ -69,11 +69,23 @@ DANE_DOMAINS=(
 # manage-dkim.sh, manage-mta-sts.sh, and manage-dane.sh's own --status)
 # still works unchanged regardless of registrar.
 #
-# Order of operations on a real change: ADD the new TLSA value first, THEN
-# delete the old one - so there is never a moment with zero valid TLSA
-# records published (a brief period with two records, both valid against
-# some certificate state, is harmless; a brief period with none is not -
-# DANE-enforcing senders would then refuse delivery entirely).
+# On a real change, UPDATE the existing record in place (same name/type,
+# its own live TTL, only the content changes) rather than add-then-delete -
+# transip-dns update is a single atomic content swap, so there is never a
+# moment with zero valid TLSA records published, same goal the old
+# add-then-delete approach had, but without its own real failure mode:
+#
+# REAL BUG FOUND 2026-11-16 (three separate live renewals, confirmed by
+# the same error every time): add-then-delete's own ADD step used a fixed
+# TTL ($TTL below, 3600s) - TransIP's API rejects adding a record into an
+# rrset that already has an entry at a DIFFERENT TTL ("the expire of all
+# records in an rrset must be all the same"), so the add failed outright
+# before the delete was ever reached, every single time this fired after
+# a key rotation. update does not have this problem: it requires (and
+# reuses) the EXISTING record's own live TTL, confirmed via
+# `transip-dns update --help`, so there's nothing to mismatch - this is
+# also the same proven-working pattern already used by manage-dane.sh's
+# own cmd_setup and bootstrap-domain-dns.sh's upsert_record().
 #
 # Usage: update-dane-tlsa.sh [cert_dir]
 #   cert_dir defaults to /etc/letsencrypt/live/mail.example.com (the live
@@ -162,22 +174,24 @@ for entry in "${DANE_DOMAINS[@]}"; do
         continue
     fi
 
-    log "Publishing new TLSA rrdata for ${RECORD_NAME}.${DOMAIN}: ${NEW_RRDATA}"
-    if ! transip-dns --username "$TRANSIP_USER" --key-file "$KEY_FILE" \
-        add "$DOMAIN" "$RECORD_NAME" TLSA "$NEW_RRDATA" --ttl "$TTL"; then
-        log "[ERROR] Could not add the new TLSA record for ${RECORD_NAME}.${DOMAIN} - the old one (if any) was left in place untouched."
-        FAILED=1
-        continue
-    fi
-    log "[ OK ] New TLSA record added for ${RECORD_NAME}.${DOMAIN}."
-
     if [[ -n "$CURRENT_RRDATA" ]]; then
-        log "Removing superseded TLSA rrdata for ${RECORD_NAME}.${DOMAIN}: ${CURRENT_RRDATA}"
-        transip-dns --username "$TRANSIP_USER" --key-file "$KEY_FILE" \
-            delete "$DOMAIN" "$RECORD_NAME" TLSA "$CURRENT_RRDATA" --ttl "${CURRENT_TTL:-$TTL}" \
-            || log "[WARN] Could not remove the old TLSA record (${CURRENT_RRDATA}) for ${RECORD_NAME}.${DOMAIN} - the new one is published and valid, but the old one is now a harmless leftover alongside it. Remove it by hand."
+        log "Updating TLSA for ${RECORD_NAME}.${DOMAIN}: ${CURRENT_RRDATA} -> ${NEW_RRDATA} (keeping its own TTL ${CURRENT_TTL})"
+        if ! transip-dns --username "$TRANSIP_USER" --key-file "$KEY_FILE" \
+            update "$DOMAIN" "$RECORD_NAME" TLSA "$NEW_RRDATA" --ttl "$CURRENT_TTL"; then
+            log "[ERROR] Could not update the TLSA record for ${RECORD_NAME}.${DOMAIN} - the old value was left in place untouched."
+            FAILED=1
+            continue
+        fi
+        log "[ OK ] TLSA record updated for ${RECORD_NAME}.${DOMAIN}."
     else
-        log "No previous TLSA record existed for ${RECORD_NAME}.${DOMAIN} - nothing to remove."
+        log "Publishing new TLSA rrdata for ${RECORD_NAME}.${DOMAIN}: ${NEW_RRDATA}"
+        if ! transip-dns --username "$TRANSIP_USER" --key-file "$KEY_FILE" \
+            add "$DOMAIN" "$RECORD_NAME" TLSA "$NEW_RRDATA" --ttl "$TTL"; then
+            log "[ERROR] Could not add the new TLSA record for ${RECORD_NAME}.${DOMAIN}."
+            FAILED=1
+            continue
+        fi
+        log "[ OK ] New TLSA record added for ${RECORD_NAME}.${DOMAIN}."
     fi
 done
 
