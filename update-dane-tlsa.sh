@@ -96,6 +96,7 @@ set -euo pipefail
 
 CERT_DIR="${1:-${RENEWED_LINEAGE:-/etc/letsencrypt/live/mail.example.com}}"
 CERT_FILE="${CERT_DIR}/cert.pem"
+FULLCHAIN_FILE="${CERT_DIR}/fullchain.pem"
 TTL=3600
 
 ACCOUNTS_DIR="/etc/letsencrypt/transip/accounts.d"
@@ -144,10 +145,77 @@ NEW_HASH="$(openssl x509 -in "$CERT_FILE" -noout -pubkey \
     | openssl dgst -sha256 -hex \
     | sed 's/^.*= //')"
 [[ "${#NEW_HASH}" -eq 64 ]] || die "Computed hash is not 64 hex chars (got '${NEW_HASH}') - refusing to publish."
-NEW_RRDATA="3 1 1 ${NEW_HASH}"
+NEW_RRDATA_EE="3 1 1 ${NEW_HASH}"
+
+# DANE-TA (2 1 1): hash of the issuing intermediate CA certificate -
+# the 2nd PEM block in fullchain.pem, not the leaf (1st block).
+# Published alongside the DANE-EE entry above at the SAME name, giving
+# a "Current + Issuer CA" rollover scheme per the Internet.nl DANE
+# test's own recommendation. Optional: if fullchain.pem is missing or
+# has no 2nd certificate, NEW_RRDATA_TA stays empty and that half is
+# simply skipped (logged, not a hard failure) rather than blocking the
+# DANE-EE update every domain actually depends on.
+NEW_RRDATA_TA=""
+if [[ -f "$FULLCHAIN_FILE" ]]; then
+    TA_HASH="$(awk -v n=2 '/-----BEGIN CERTIFICATE-----/{c++} c==n{print} /-----END CERTIFICATE-----/{if(c==n) exit}' "$FULLCHAIN_FILE" \
+        | openssl x509 -noout -pubkey 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | openssl dgst -sha256 -hex 2>/dev/null \
+        | sed 's/^.*= //')"
+    [[ "${#TA_HASH}" -eq 64 ]] && NEW_RRDATA_TA="2 1 1 ${TA_HASH}"
+fi
+if [[ -z "$NEW_RRDATA_TA" ]]; then
+    log "[WARN] Could not compute a DANE-TA (2 1 1) value from ${FULLCHAIN_FILE} - only the DANE-EE (3 1 1) record will be kept in sync this run."
+fi
+
+# publish_one_tlsa <domain> <record_name> <user> <key_file> <usage_prefix> <new_rrdata>:
+# shared add/update/skip logic for ONE TLSA usage-type at
+# <record_name>.<domain> - called once per domain for DANE-EE and
+# once for DANE-TA. Both share the same name+type (TLSA), and TransIP
+# requires every record in that rrset to share one TTL (its own 406
+# error says so) - so filtering the live lookup by usage-type prefix
+# (leading "3 "/"2 ") is required once both entries coexist, but the
+# TTL found for either one is always valid for an update of the
+# other too.
+publish_one_tlsa()
+{
+    local domain="$1" record_name="$2" user="$3" key_file="$4" usage_prefix="$5" new_rrdata="$6"
+    [[ -n "$new_rrdata" ]] || return 0
+
+    local current_line current_rrdata current_ttl
+    current_line="$(transip-dns --username "$user" --key-file "$key_file" list "$domain" 2>/dev/null \
+        | awk -v n="$record_name" -v u="$usage_prefix" '$1==n && $3=="TLSA" && $4==u')"
+    current_rrdata="$(echo "$current_line" | sed -E 's/^\S+\s+\S+\s+\S+\s+//')"
+    current_ttl="$(echo "$current_line" | awk '{print $2}')"
+
+    if [[ -n "$current_rrdata" && "$current_rrdata" == "$new_rrdata" ]]; then
+        log "[ OK ] TLSA (${usage_prefix} x x) for ${record_name}.${domain} already matches - nothing to do."
+        return 0
+    fi
+
+    if [[ -n "$current_rrdata" ]]; then
+        log "Updating TLSA (${usage_prefix} x x) for ${record_name}.${domain}: ${current_rrdata} -> ${new_rrdata} (keeping its own TTL ${current_ttl})"
+        if ! transip-dns --username "$user" --key-file "$key_file" \
+            update "$domain" "$record_name" TLSA "$new_rrdata" --ttl "$current_ttl"; then
+            log "[ERROR] Could not update the TLSA (${usage_prefix} x x) record for ${record_name}.${domain} - the old value was left in place untouched."
+            return 1
+        fi
+        log "[ OK ] TLSA (${usage_prefix} x x) record updated for ${record_name}.${domain}."
+    else
+        log "Publishing new TLSA (${usage_prefix} x x) rrdata for ${record_name}.${domain}: ${new_rrdata}"
+        if ! transip-dns --username "$user" --key-file "$key_file" \
+            add "$domain" "$record_name" TLSA "$new_rrdata" --ttl "$TTL"; then
+            log "[ERROR] Could not add the new TLSA (${usage_prefix} x x) record for ${record_name}.${domain}."
+            return 1
+        fi
+        log "[ OK ] New TLSA (${usage_prefix} x x) record added for ${record_name}.${domain}."
+    fi
+    return 0
+}
 
 # One certificate, one key, so every domain below gets the exact same
-# new TLSA rrdata - computed once, then applied per domain:label pair.
+# new TLSA rrdata - computed once above, then applied per domain:label
+# pair.
 FAILED=0
 for entry in "${DANE_DOMAINS[@]}"; do
     DOMAIN="${entry%%:*}"
@@ -164,35 +232,8 @@ for entry in "${DANE_DOMAINS[@]}"; do
         continue
     fi
 
-    CURRENT_LINE="$(transip-dns --username "$TRANSIP_USER" --key-file "$KEY_FILE" list "$DOMAIN" 2>/dev/null \
-        | awk -v n="$RECORD_NAME" '$1==n && $3=="TLSA"')"
-    CURRENT_RRDATA="$(echo "$CURRENT_LINE" | sed -E 's/^\S+\s+\S+\s+\S+\s+//')"
-    CURRENT_TTL="$(echo "$CURRENT_LINE" | awk '{print $2}')"
-
-    if [[ -n "$CURRENT_RRDATA" && "$CURRENT_RRDATA" == "$NEW_RRDATA" ]]; then
-        log "[ OK ] TLSA for ${RECORD_NAME}.${DOMAIN} already matches the current certificate - nothing to do."
-        continue
-    fi
-
-    if [[ -n "$CURRENT_RRDATA" ]]; then
-        log "Updating TLSA for ${RECORD_NAME}.${DOMAIN}: ${CURRENT_RRDATA} -> ${NEW_RRDATA} (keeping its own TTL ${CURRENT_TTL})"
-        if ! transip-dns --username "$TRANSIP_USER" --key-file "$KEY_FILE" \
-            update "$DOMAIN" "$RECORD_NAME" TLSA "$NEW_RRDATA" --ttl "$CURRENT_TTL"; then
-            log "[ERROR] Could not update the TLSA record for ${RECORD_NAME}.${DOMAIN} - the old value was left in place untouched."
-            FAILED=1
-            continue
-        fi
-        log "[ OK ] TLSA record updated for ${RECORD_NAME}.${DOMAIN}."
-    else
-        log "Publishing new TLSA rrdata for ${RECORD_NAME}.${DOMAIN}: ${NEW_RRDATA}"
-        if ! transip-dns --username "$TRANSIP_USER" --key-file "$KEY_FILE" \
-            add "$DOMAIN" "$RECORD_NAME" TLSA "$NEW_RRDATA" --ttl "$TTL"; then
-            log "[ERROR] Could not add the new TLSA record for ${RECORD_NAME}.${DOMAIN}."
-            FAILED=1
-            continue
-        fi
-        log "[ OK ] New TLSA record added for ${RECORD_NAME}.${DOMAIN}."
-    fi
+    publish_one_tlsa "$DOMAIN" "$RECORD_NAME" "$TRANSIP_USER" "$KEY_FILE" "3" "$NEW_RRDATA_EE" || FAILED=1
+    publish_one_tlsa "$DOMAIN" "$RECORD_NAME" "$TRANSIP_USER" "$KEY_FILE" "2" "$NEW_RRDATA_TA" || FAILED=1
 done
 
 (( FAILED == 0 )) || die "One or more domains failed to update - see [ERROR] lines above."

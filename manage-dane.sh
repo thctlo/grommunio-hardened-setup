@@ -146,6 +146,29 @@ expected_tlsa_for()
     echo "3 1 1 ${hash}"
 }
 
+# expected_tlsa_ta_for: "2 1 1 <hash>" (DANE-TA) computed from the
+# CURRENT certificate chain's own issuing intermediate CA certificate
+# - the 2nd PEM block in fullchain.pem, not the leaf (1st block).
+# Published alongside expected_tlsa_for()'s own "3 1 1" record at the
+# SAME name, giving a rollover scheme ("Current + Issuer CA") per the
+# Internet.nl DANE test's own recommendation: even if the leaf key
+# changes, this entry stays valid as long as Let's Encrypt keeps using
+# the same intermediate - which changes far less often than our own
+# key does. Prints nothing if fullchain.pem is missing, there is no
+# 2nd certificate in it, or the hash isn't 64 hex chars - callers must
+# check for that, same contract as expected_tlsa_for().
+expected_tlsa_ta_for()
+{
+    local hash
+    [[ -f "/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem" ]] || return 0
+    hash="$(awk -v n=2 '/-----BEGIN CERTIFICATE-----/{c++} c==n{print} /-----END CERTIFICATE-----/{if(c==n) exit}' \
+        "/etc/letsencrypt/live/${CERT_NAME}/fullchain.pem" \
+        | openssl x509 -noout -pubkey 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -hex 2>/dev/null | sed 's/^.*= //')"
+    [[ "${#hash}" -eq 64 ]] || return 0
+    echo "2 1 1 ${hash}"
+}
+
 # ============================================================
 # cmd_status: report-only, never changes anything.
 # ============================================================
@@ -186,10 +209,10 @@ cmd_status()
     local out v4 v6
     v4="" v6=""
     if out="$(resolvectl query --type=A "$target" 2>/dev/null)"; then
-        v4="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<< "$out" | head -1)"
+        v4="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<< "$out" | head -1 || true)"
     fi
     if out="$(resolvectl query --type=AAAA "$target" 2>/dev/null)"; then
-        v6="$(grep -oE '[0-9a-fA-F:]+:[0-9a-fA-F:]+' <<< "$out" | head -1)"
+        v6="$(grep -oE '[0-9a-fA-F:]+:[0-9a-fA-F:]+' <<< "$out" | head -1 || true)"
     fi
     if [[ -n "$v4" || -n "$v6" ]]; then
         okline "${target} resolves (A: ${v4:-<none>}, AAAA: ${v6:-<none>})."
@@ -215,10 +238,19 @@ cmd_status()
         failed=$((failed + 1))
     fi
 
-    local tlsa_live="" want_tlsa=""
+    # Two TLSA records now coexist at the same name (DANE-EE "3 1 1"
+    # for the leaf key, DANE-TA "2 1 1" for the issuing intermediate -
+    # the "Current + Issuer CA" rollover scheme). Each lookup below
+    # filters by its own usage-type digit (leading "3 " or "2 ") so
+    # the two checks never pick up each other's value.
+    local out_tlsa_all
+    out_tlsa_all=""
     if out="$(resolvectl query --type=TLSA "_25._tcp.${target}" 2>/dev/null)"; then
-        tlsa_live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | head -1)"
+        out_tlsa_all="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" || true)"
     fi
+
+    local tlsa_live="" want_tlsa=""
+    tlsa_live="$(grep -E '^3 ' <<< "$out_tlsa_all" | head -1 || true)"
     want_tlsa="$(expected_tlsa_for)"
     # REAL BUG FOUND 2026-11-15: this used to only check whether ANY TLSA
     # record existed at this name - never whether its VALUE still matches
@@ -228,10 +260,10 @@ cmd_status()
     # longer matched the live certificate at all - the exact kind of
     # silent drift DANE is supposed to prevent, not cause.
     if [[ -z "$tlsa_live" ]]; then
-        failline "No TLSA record published yet at _25._tcp.${target}."
+        failline "No DANE-EE (3 1 1) TLSA record published yet at _25._tcp.${target}."
         failed=$((failed + 1))
     elif [[ -n "$want_tlsa" && "${tlsa_live,,}" != "${want_tlsa,,}" ]]; then
-        failline "TLSA record is stale: published \"${tlsa_live}\", current certificate needs \"${want_tlsa}\" - run --setup to update it."
+        failline "DANE-EE TLSA record is stale: published \"${tlsa_live}\", current certificate needs \"${want_tlsa}\" - run --setup to update it."
         if [[ "$BRIEF" -ne 1 ]]; then
             echo "       If --setup already ran: this can just be the record's own TTL not having"
             echo "       expired yet in a resolver's cache (including this server's own) - compare"
@@ -240,7 +272,20 @@ cmd_status()
         fi
         failed=$((failed + 1))
     else
-        okline "TLSA record published and matches the current certificate: ${tlsa_live}"
+        okline "DANE-EE (3 1 1) TLSA record published and matches the current certificate: ${tlsa_live}"
+    fi
+
+    local tlsa_ta_live="" want_tlsa_ta=""
+    tlsa_ta_live="$(grep -E '^2 ' <<< "$out_tlsa_all" | head -1 || true)"
+    want_tlsa_ta="$(expected_tlsa_ta_for)"
+    if [[ -z "$tlsa_ta_live" ]]; then
+        failline "No DANE-TA (2 1 1, issuer CA / rollover scheme) TLSA record published yet at _25._tcp.${target}."
+        failed=$((failed + 1))
+    elif [[ -n "$want_tlsa_ta" && "${tlsa_ta_live,,}" != "${want_tlsa_ta,,}" ]]; then
+        failline "DANE-TA TLSA record is stale: published \"${tlsa_ta_live}\", current intermediate CA needs \"${want_tlsa_ta}\" - run --setup to update it."
+        failed=$((failed + 1))
+    else
+        okline "DANE-TA (2 1 1) TLSA record published and matches the current issuing CA: ${tlsa_ta_live}"
     fi
 
     if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then
@@ -302,10 +347,10 @@ cmd_setup()
             key_file="$(transip_key_for "$domain")"
             ipv4="" ipv6=""
             if out="$(resolvectl query --type=A "mail.${domain}" 2>/dev/null)"; then
-                ipv4="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<< "$out" | head -1)"
+                ipv4="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<< "$out" | head -1 || true)"
             fi
             if out="$(resolvectl query --type=AAAA "mail.${domain}" 2>/dev/null)"; then
-                ipv6="$(grep -oE '[0-9a-fA-F:]+:[0-9a-fA-F:]+' <<< "$out" | head -1)"
+                ipv6="$(grep -oE '[0-9a-fA-F:]+:[0-9a-fA-F:]+' <<< "$out" | head -1 || true)"
             fi
             [[ -n "$ipv4" ]] && transip-dns --username "$user" --key-file "$key_file" add "$domain" "$label" A "$ipv4" --ttl 86400
             [[ -n "$ipv6" ]] && transip-dns --username "$user" --key-file "$key_file" add "$domain" "$label" AAAA "$ipv6" --ttl 86400
@@ -324,63 +369,78 @@ cmd_setup()
     log "Ensuring the certificate covers ${target} and reuse_key is set..."
     "${SCRIPT_DIR}/manage-certs.sh" --all
 
-    local tlsa_live="" out want_tlsa
-    if out="$(resolvectl query --type=TLSA "_25._tcp.${target}" 2>/dev/null)"; then
-        tlsa_live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | head -1)"
-    fi
-    want_tlsa="$(expected_tlsa_for)"
-    [[ -n "$want_tlsa" ]] || die "Could not compute the expected TLSA value from /etc/letsencrypt/live/${CERT_NAME}/cert.pem - refusing to publish."
+    # publish_tlsa_entry <usage_prefix> <description> <want_value>:
+    # shared add/update/skip logic for ONE TLSA usage-type at
+    # _25._tcp.<label>.<domain> - called once for DANE-EE ("3 1 1",
+    # the leaf key, existing behaviour) and once for DANE-TA
+    # ("2 1 1", the issuing intermediate CA) - the "Current + Issuer
+    # CA" rollover scheme the Internet.nl DANE test recommends. Both
+    # entries share the same name+type (TLSA), so TransIP requires
+    # them to share one TTL too (confirmed via its own 406 error
+    # wording) - transip_live_ttl_for's plain name+type match is
+    # therefore always correct here, regardless of which usage-type
+    # entry it happens to find first.
+    publish_tlsa_entry()
+    {
+        local usage_prefix="$1" description="$2" want_value="$3"
+        local live="" out
+        if out="$(resolvectl query --type=TLSA "_25._tcp.${target}" 2>/dev/null)"; then
+            live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | grep -E "^${usage_prefix} " | head -1 || true)"
+        fi
+        [[ -n "$want_value" ]] || die "Could not compute the expected ${description} value - refusing to publish."
 
-    if [[ -z "$tlsa_live" ]]; then
-        if have_transip_creds "$domain"; then
-            log "Computing and publishing the initial TLSA record..."
-            require_cmd transip-dns
-            local user key_file; user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
-            transip-dns --username "$user" --key-file "$key_file" \
-                add "$domain" "_25._tcp.${label}" TLSA "$want_tlsa" --ttl "$TTL"
-            log "[ OK ] Published TLSA: ${want_tlsa}"
-            log "      TTL is ${TTL}s - resolvers (including this server's own cache) may keep"
-            log "      answering with no/old data for up to that long. A --status run inside"
-            log "      this window can still show [FAIL] even though the record is correct."
+        if [[ -z "$live" ]]; then
+            if have_transip_creds "$domain"; then
+                log "Computing and publishing the initial ${description} record..."
+                require_cmd transip-dns
+                local user key_file; user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
+                transip-dns --username "$user" --key-file "$key_file" \
+                    add "$domain" "_25._tcp.${label}" TLSA "$want_value" --ttl "$TTL"
+                log "[ OK ] Published ${description}: ${want_value}"
+                log "      TTL is ${TTL}s - resolvers (including this server's own cache) may keep"
+                log "      answering with no/old data for up to that long. A --status run inside"
+                log "      this window can still show [FAIL] even though the record is correct."
+            else
+                err "No ${description} record exists and no TransIP credentials are available to publish one."
+                err "Publish as: _25._tcp.${target}  TLSA  ${want_value}"
+                return 1
+            fi
+        elif [[ "${live,,}" != "${want_value,,}" ]]; then
+            # REAL BUG FOUND 2026-11-15: this branch didn't exist at all -
+            # any existing record, however stale, was reported "already
+            # published" and left untouched forever. Using transip-dns
+            # update (name/type/ttl must match the live record exactly,
+            # only content changes), not add - add would create a SECOND,
+            # conflicting TLSA record alongside the stale one instead of
+            # replacing it.
+            if have_transip_creds "$domain"; then
+                log "Published ${description} record is stale (${live}) - updating to match the current certificate..."
+                require_cmd transip-dns
+                local user key_file live_ttl
+                user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
+                live_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
+                [[ -n "$live_ttl" ]] || die "Could not find the live TLSA record's own TTL via transip-dns list - refusing to guess one for update."
+                transip-dns --username "$user" --key-file "$key_file" \
+                    update "$domain" "_25._tcp.${label}" TLSA "$want_value" --ttl "$live_ttl"
+                log "[ OK ] Updated ${description} record: ${live} -> ${want_value}"
+                log "      TTL is ${live_ttl}s - resolvers (including this server's own cache) may"
+                log "      keep answering with the OLD value for up to that long. A --status run"
+                log "      inside this window can still show [FAIL] stale even though TransIP's"
+                log "      own answer (transip-dns list ${domain}) is already correct."
+            else
+                err "Published ${description} record is stale and no TransIP credentials are available to update it."
+                err "Current:   _25._tcp.${target}  TLSA  ${live}"
+                err "Should be: _25._tcp.${target}  TLSA  ${want_value}"
+                return 1
+            fi
         else
-            err "No TLSA record exists and no TransIP credentials are available to publish one."
-            err "Compute it by hand (usage 3, selector 1, matching-type 1 / SPKI-SHA256):"
-            err "  openssl x509 -in /etc/letsencrypt/live/${CERT_NAME}/cert.pem -noout -pubkey \\"
-            err "    | openssl pkey -pubin -outform DER | openssl dgst -sha256 -hex"
-            err "Publish as: _25._tcp.${target}  TLSA  ${want_tlsa}"
-            return 1
+            [[ "$BRIEF" -eq 1 ]] || log "[ OK ] ${description} record already published and matches the current certificate: ${live}"
         fi
-    elif [[ "${tlsa_live,,}" != "${want_tlsa,,}" ]]; then
-        # REAL BUG FOUND 2026-11-15: this branch didn't exist at all -
-        # any existing record, however stale, was reported "already
-        # published" and left untouched forever. Using transip-dns
-        # update (name/type/ttl must match the live record exactly,
-        # only content changes), not add - add would create a SECOND,
-        # conflicting TLSA record alongside the stale one instead of
-        # replacing it.
-        if have_transip_creds "$domain"; then
-            log "Published TLSA record is stale (${tlsa_live}) - updating to match the current certificate..."
-            require_cmd transip-dns
-            local user key_file live_ttl
-            user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
-            live_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
-            [[ -n "$live_ttl" ]] || die "Could not find the live TLSA record's own TTL via transip-dns list - refusing to guess one for update."
-            transip-dns --username "$user" --key-file "$key_file" \
-                update "$domain" "_25._tcp.${label}" TLSA "$want_tlsa" --ttl "$live_ttl"
-            log "[ OK ] Updated TLSA record: ${tlsa_live} -> ${want_tlsa}"
-            log "      TTL is ${live_ttl}s - resolvers (including this server's own cache) may"
-            log "      keep answering with the OLD value for up to that long. A --status run"
-            log "      inside this window can still show [FAIL] stale even though TransIP's"
-            log "      own answer (transip-dns list ${domain}) is already correct."
-        else
-            err "Published TLSA record is stale and no TransIP credentials are available to update it."
-            err "Current:   _25._tcp.${target}  TLSA  ${tlsa_live}"
-            err "Should be: _25._tcp.${target}  TLSA  ${want_tlsa}"
-            return 1
-        fi
-    else
-        [[ "$BRIEF" -eq 1 ]] || log "[ OK ] TLSA record already published and matches the current certificate: ${tlsa_live}"
-    fi
+        return 0
+    }
+
+    publish_tlsa_entry "3" "DANE-EE (3 1 1)" "$(expected_tlsa_for)" || return 1
+    publish_tlsa_entry "2" "DANE-TA (2 1 1, issuer CA)" "$(expected_tlsa_ta_for)" || return 1
 
     if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then
         [[ "$BRIEF" -eq 1 ]] || log "[ OK ] ${domain} already in update-dane-tlsa.sh's DANE_DOMAINS."

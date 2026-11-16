@@ -415,7 +415,7 @@ check_dane()
         warn "DANE for $dom: no TLSA record at _25._tcp.${target} - optional, but recommended (see manage-dane.sh)."
         return
     fi
-    tlsa_live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | head -1)"
+    tlsa_live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | head -1 || true)"
     if [[ -z "$tlsa_live" ]]; then
         warn "DANE for $dom: no TLSA record at _25._tcp.${target} - optional, but recommended (see manage-dane.sh)."
         return
@@ -707,7 +707,7 @@ cmd_report()
     local current_sts_out current_sts_id suggested_sts_id mta_sts_status
     suggested_sts_id="$(date +%Y%m%d%H%M)"
     if current_sts_out="$(resolvectl query --type=TXT "_mta-sts.${dom}" 2>/dev/null)"; then
-        current_sts_id="$(grep -oE 'id=[^";[:space:]]+' <<< "$current_sts_out" | head -1)"
+        current_sts_id="$(grep -oE 'id=[^";[:space:]]+' <<< "$current_sts_out" | head -1 || true)"
         if [[ -n "$current_sts_id" ]]; then
             mta_sts_status="currently: v=STSv1; ${current_sts_id} - bump to a new id below only if the policy itself changed"
         else
@@ -726,7 +726,7 @@ cmd_report()
     if ! dane_tlsa_out="$(resolvectl query --type=TLSA "_25._tcp.${dane_check_target}" 2>/dev/null)"; then
         dane_status="currently: no TLSA record at _25._tcp.${dane_check_target}"
     else
-        dane_tlsa_live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$dane_tlsa_out" | head -1)"
+        dane_tlsa_live="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$dane_tlsa_out" | head -1 || true)"
         if [[ -z "$dane_tlsa_live" ]]; then
             dane_status="currently: no TLSA record at _25._tcp.${dane_check_target}"
         elif [[ -f "$dane_cert" ]]; then

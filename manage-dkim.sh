@@ -437,8 +437,8 @@ cmd_validate()
             check_txt_selector "$d" "$RSPAMD_DKIM_RSA_SELECTOR" || echo "__FAIL__"
             check_dkim_cname "$d" || echo "__FAIL__"
         )"
-        domain_failed="$(grep -c '__FAIL__' <<< "$domain_out")"
-        domain_out="$(grep -v '__FAIL__' <<< "$domain_out")"
+        domain_failed="$(grep -c '__FAIL__' <<< "$domain_out" || true)"
+        domain_out="$(grep -v '__FAIL__' <<< "$domain_out" || true)"
         failed=$((failed + domain_failed))
         if [[ "$domain_failed" -gt 0 || "$BRIEF" -ne 1 ]]; then
             echo

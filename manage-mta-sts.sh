@@ -425,7 +425,7 @@ cmd_status()
                     fi
 
                     expected_mx="$(policy_mx_for "$d")"
-                    actual_mx="$(grep -E '^mx:' <<< "$served" | awk '{print $2}')"
+                    actual_mx="$(grep -E '^mx:' <<< "$served" | awk '{print $2}' || true)"
                     if [[ "$actual_mx" == "$expected_mx" ]]; then
                         okline "Served mx ($actual_mx) matches this domain's real MX hostname."
                     else
@@ -441,9 +441,9 @@ cmd_status()
                 echo "__SKIP__"
             fi
         )"
-        domain_failed="$(grep -c '__FAIL__' <<< "$domain_out")"
-        skipped="$(grep -c '__SKIP__' <<< "$domain_out")"
-        domain_out="$(grep -vE '__FAIL__|__SKIP__' <<< "$domain_out")"
+        domain_failed="$(grep -c '__FAIL__' <<< "$domain_out" || true)"
+        skipped="$(grep -c '__SKIP__' <<< "$domain_out" || true)"
+        domain_out="$(grep -vE '__FAIL__|__SKIP__' <<< "$domain_out" || true)"
         failed=$((failed + domain_failed))
         if [[ "$domain_failed" -gt 0 || ( "$BRIEF" -ne 1 && "$skipped" -eq 0 ) ]]; then
             echo
@@ -496,7 +496,7 @@ setup_mta_sts_txt()
     expected="$(mta_sts_expected_txt_for "$dom")" || { err "${name}.${dom}: no local policy file yet - this should not happen after --reconfigure."; return 1; }
 
     if dns_out="$(resolvectl query --type=TXT "${name}.${dom}" 2>/dev/null)"; then
-        actual="$(grep -o 'v=STSv1[^"]*' <<< "$dns_out" | head -1)"
+        actual="$(grep -o 'v=STSv1[^"]*' <<< "$dns_out" | head -1 || true)"
     fi
 
     if [[ -n "$actual" && "$actual" == "$expected" ]]; then
