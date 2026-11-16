@@ -169,6 +169,36 @@ expected_tlsa_ta_for()
     echo "2 1 1 ${hash}"
 }
 
+# tlsa_lookup <domain> <label> <usage_prefix>: prints the matching
+# TLSA record's rrdata (e.g. "2 1 1 <hash>"), or nothing if none
+# exists. Prefers transip-dns list - the authoritative source,
+# queried live with zero caching - over resolvectl's own DNS-based
+# lookup, whenever TransIP credentials are available for this
+# domain. REAL BUG FOUND 2026-11-16: --status used resolvectl only,
+# which can lag the true state by up to the record's own TTL (a
+# resolver cache, including this server's own) - right after a
+# --setup run that had genuinely just succeeded, --status still
+# showed [FAIL] for several minutes even though `transip-dns list`
+# already showed the correct value. Falls back to resolvectl only
+# when there is no TransIP access to query directly (a different
+# registrar) - that case has no zero-caching alternative available.
+tlsa_lookup()
+{
+    local domain="$1" label="$2" usage_prefix="$3"
+    if have_transip_creds "$domain"; then
+        local user key_file
+        user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
+        transip-dns --username "$user" --key-file "$key_file" list "$domain" 2>/dev/null \
+            | awk -v n="_25._tcp.${label}" -v u="$usage_prefix" \
+                '$1==n && $3=="TLSA" && $4==u { for (i=4; i<=NF; i++) printf "%s%s", $i, (i<NF ? " " : "\n") }'
+    else
+        local out
+        if out="$(resolvectl query --type=TLSA "_25._tcp.${label}.${domain}" 2>/dev/null)"; then
+            grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | grep -E "^${usage_prefix} " | head -1 || true
+        fi
+    fi
+}
+
 # ============================================================
 # cmd_status: report-only, never changes anything.
 # ============================================================
@@ -240,17 +270,13 @@ cmd_status()
 
     # Two TLSA records now coexist at the same name (DANE-EE "3 1 1"
     # for the leaf key, DANE-TA "2 1 1" for the issuing intermediate -
-    # the "Current + Issuer CA" rollover scheme). Each lookup below
-    # filters by its own usage-type digit (leading "3 " or "2 ") so
-    # the two checks never pick up each other's value.
-    local out_tlsa_all
-    out_tlsa_all=""
-    if out="$(resolvectl query --type=TLSA "_25._tcp.${target}" 2>/dev/null)"; then
-        out_tlsa_all="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" || true)"
-    fi
-
+    # the "Current + Issuer CA" rollover scheme). tlsa_lookup() (see
+    # its own header) prefers transip-dns list - zero caching - over
+    # DNS resolution, so a --setup run's result shows correctly here
+    # immediately, not just after the record's own TTL expires
+    # everywhere.
     local tlsa_live="" want_tlsa=""
-    tlsa_live="$(grep -E '^3 ' <<< "$out_tlsa_all" | head -1 || true)"
+    tlsa_live="$(tlsa_lookup "$domain" "$label" "3")"
     want_tlsa="$(expected_tlsa_for)"
     # REAL BUG FOUND 2026-11-15: this used to only check whether ANY TLSA
     # record existed at this name - never whether its VALUE still matches
@@ -264,19 +290,13 @@ cmd_status()
         failed=$((failed + 1))
     elif [[ -n "$want_tlsa" && "${tlsa_live,,}" != "${want_tlsa,,}" ]]; then
         failline "DANE-EE TLSA record is stale: published \"${tlsa_live}\", current certificate needs \"${want_tlsa}\" - run --setup to update it."
-        if [[ "$BRIEF" -ne 1 ]]; then
-            echo "       If --setup already ran: this can just be the record's own TTL not having"
-            echo "       expired yet in a resolver's cache (including this server's own) - compare"
-            echo "       against \`transip-dns list ${domain}\` (bypasses caching) before assuming"
-            echo "       --setup didn't work."
-        fi
         failed=$((failed + 1))
     else
         okline "DANE-EE (3 1 1) TLSA record published and matches the current certificate: ${tlsa_live}"
     fi
 
     local tlsa_ta_live="" want_tlsa_ta=""
-    tlsa_ta_live="$(grep -E '^2 ' <<< "$out_tlsa_all" | head -1 || true)"
+    tlsa_ta_live="$(tlsa_lookup "$domain" "$label" "2")"
     want_tlsa_ta="$(expected_tlsa_ta_for)"
     if [[ -z "$tlsa_ta_live" ]]; then
         failline "No DANE-TA (2 1 1, issuer CA / rollover scheme) TLSA record published yet at _25._tcp.${target}."
@@ -383,11 +403,8 @@ cmd_setup()
     publish_tlsa_entry()
     {
         local usage_prefix="$1" description="$2" want_value="$3"
-        local live="" out all_lines=""
-        if out="$(resolvectl query --type=TLSA "_25._tcp.${target}" 2>/dev/null)"; then
-            all_lines="$(grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" || true)"
-            live="$(grep -E "^${usage_prefix} " <<< "$all_lines" | head -1 || true)"
-        fi
+        local live=""
+        live="$(tlsa_lookup "$domain" "$label" "$usage_prefix")"
         [[ -n "$want_value" ]] || die "Could not compute the expected ${description} value - refusing to publish."
 
         if [[ -z "$live" ]]; then
@@ -404,12 +421,9 @@ cmd_setup()
                 # same") whenever that sibling's own live TTL differs.
                 # Use the sibling's live TTL when one exists, $TTL only
                 # when this is truly the first TLSA record at this name.
-                local add_ttl="$TTL"
-                if [[ -n "$all_lines" ]]; then
-                    local sibling_ttl
-                    sibling_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
-                    [[ -n "$sibling_ttl" ]] && add_ttl="$sibling_ttl"
-                fi
+                local add_ttl="$TTL" sibling_ttl
+                sibling_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
+                [[ -n "$sibling_ttl" ]] && add_ttl="$sibling_ttl"
                 # Also found in the same incident: this add's own exit
                 # status was never checked, so a failed add (like the
                 # TTL-mismatch 406 above) was still reported "[ OK ]
