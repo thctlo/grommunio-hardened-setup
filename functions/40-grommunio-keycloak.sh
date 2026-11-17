@@ -242,6 +242,61 @@ check_file /etc/gromox/keycloak.json root:groweb 640
 check_file /etc/gromox/bearer_pubkey root:root 644
 
 # ============================================================
+# Pin grommunio-web's own OIDC callback URL (2026-11-17). Without
+# "redirect-url" set, grommunio-web builds its redirect_uri dynamically
+# from whatever Host header the browser used - but Keycloak's own
+# grommunio-web client has only ONE registered valid redirect URI (this
+# server's own system hostname's /web, confirmed via `kcadm.sh get
+# clients`). Visiting via any OTHER hostname nginx also answers for
+# (e.g. a migrated domain's own mail.* name, cut over to this server)
+# then fails with "Invalid parameter: redirect_uri" - confirmed live
+# 2026-11-17 for example2.com. Per the grommunio setup guide's own
+# troubleshooting table: "Use one FQDN everywhere; set redirect-url in
+# keycloak.json if nginx serves several host names." Pinned to this
+# server's own system hostname - the same value already used as the
+# Keycloak client's rootUrl and as this same file's own
+# auth-server-url, read back from there rather than assumed - so every
+# domain's webmail login completes there. This also matches the same
+# single-hostname design gromox's own AutoDiscover already uses
+# unconditionally (oxdisco_exonym, see autodiscover(4gx): a single,
+# global value, not per-domain, by gromox's own design) - confirmed
+# live that AutoDiscover for a migrated domain's mailbox already
+# always names this server's own hostname regardless of domain, so
+# this pin does not introduce any new inconsistency.
+# ============================================================
+
+local KEYCLOAK_JSON="/etc/gromox/keycloak.json"
+local KEYCLOAK_AUTH_SERVER_URL KEYCLOAK_SYSTEM_FQDN KEYCLOAK_REDIRECT_URL_WANT KEYCLOAK_CURRENT_REDIRECT_URL
+if [[ -f "$KEYCLOAK_JSON" ]]; then
+    KEYCLOAK_AUTH_SERVER_URL="$(python3 -c "import json; print(json.load(open('$KEYCLOAK_JSON')).get('auth-server-url',''))" 2>/dev/null || true)"
+    KEYCLOAK_SYSTEM_FQDN="$(sed -E 's#^https?://([^/]+)/?.*#\1#' <<< "$KEYCLOAK_AUTH_SERVER_URL")"
+    if [[ -n "$KEYCLOAK_SYSTEM_FQDN" ]]; then
+        KEYCLOAK_REDIRECT_URL_WANT="https://${KEYCLOAK_SYSTEM_FQDN}/web"
+        KEYCLOAK_CURRENT_REDIRECT_URL="$(python3 -c "import json; print(json.load(open('$KEYCLOAK_JSON')).get('redirect-url',''))" 2>/dev/null || true)"
+        if [[ "$KEYCLOAK_CURRENT_REDIRECT_URL" == "$KEYCLOAK_REDIRECT_URL_WANT" ]]; then
+            log "[ OK ] keycloak.json's redirect-url already pinned to ${KEYCLOAK_REDIRECT_URL_WANT}."
+        else
+            backup_file "$KEYCLOAK_JSON"
+            python3 -c "
+import json
+with open('$KEYCLOAK_JSON') as f:
+    data = json.load(f)
+data['redirect-url'] = '$KEYCLOAK_REDIRECT_URL_WANT'
+with open('$KEYCLOAK_JSON', 'w') as f:
+    json.dump(data, f, indent=4)
+    f.write('\n')
+" || die "Could not update redirect-url in $KEYCLOAK_JSON."
+            chown root:groweb "$KEYCLOAK_JSON"
+            chmod 640 "$KEYCLOAK_JSON"
+            finalize_backup "$KEYCLOAK_JSON"
+            log "[ OK ] Set keycloak.json's redirect-url to ${KEYCLOAK_REDIRECT_URL_WANT} (was: '${KEYCLOAK_CURRENT_REDIRECT_URL:-unset}')."
+        fi
+    else
+        err "Could not determine this server's own FQDN from keycloak.json's auth-server-url ('${KEYCLOAK_AUTH_SERVER_URL}') - skipping the redirect-url pin."
+    fi
+fi
+
+# ============================================================
 # Server-level safety net for the keycloak.json permission regression
 # (see fix-keycloak-json-perm.sh for the full root cause): the
 # check_file call above only re-asserts the permission when THIS step is
