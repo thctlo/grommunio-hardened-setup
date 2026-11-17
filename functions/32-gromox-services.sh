@@ -152,9 +152,31 @@ fi
 # now gets a handshake failure on both 993 and 995; forcing the AEAD
 # equivalent (...-AES256-GCM-SHA384) still works; and a real IMAPS/POP3S
 # login with a throwaway account succeeded on both ports afterward.
+#
+# EXTENDED 2026-11-17: also excludes SHA-1 as a TLS signature algorithm
+# (SignatureAlgorithms), matching the same RFC 9155 defense-in-depth
+# hardening already applied to Postfix (functions/34-postfix-tls.sh) and
+# nginx (functions/33-nginx-sites.sh) - same exact algorithm list, for
+# consistency across every TLS-terminating service on this server.
+# Reuses this already-proven mechanism as-is (a plain file path via
+# Environment=, no chroot/socket/bind-mount involved at all, so none of
+# the staleness problems found this same day with saslauthd's bind
+# mount apply here). Renamed the scoped file from openssl-noncbc.cnf to
+# gromox_tls_config.cnf, since it is no longer only about CBC exclusion -
+# the old file and the systemd overrides pointing at it are cleaned up
+# below. Verified live with the same discriminating test used for
+# Postfix/nginx: a SHA-256 signature offer still works, a SHA-1-only
+# offer is refused, on every port this mechanism covers.
 # ============================================================
 
-local GROMOX_OPENSSL_CNF="/etc/gromox/openssl-noncbc.cnf"
+local GROMOX_OLD_OPENSSL_CNF="/etc/gromox/openssl-noncbc.cnf"
+local GROMOX_OPENSSL_CNF="/etc/gromox/gromox_tls_config.cnf"
+if [[ -f "$GROMOX_OLD_OPENSSL_CNF" ]]; then
+    backup_file "$GROMOX_OLD_OPENSSL_CNF"
+    rm -f "$GROMOX_OLD_OPENSSL_CNF"
+    log "[ OK ] Removed the old $GROMOX_OLD_OPENSSL_CNF (renamed to $GROMOX_OPENSSL_CNF)."
+fi
+
 local GROMOX_OPENSSL_CNF_NEW
 GROMOX_OPENSSL_CNF_NEW="$(mktemp)"
 cat /etc/ssl/openssl.cnf > "$GROMOX_OPENSSL_CNF_NEW"
@@ -171,6 +193,7 @@ system_default = system_default_sect
 
 [system_default_sect]
 CipherString = DEFAULT:!CBC
+SignatureAlgorithms = ECDSA+SHA512:ECDSA+SHA384:ECDSA+SHA256:RSA-PSS+SHA512:RSA-PSS+SHA384:RSA-PSS+SHA256:RSA+SHA512:RSA+SHA384:RSA+SHA256
 CONF
 
 local gromox_openssl_changed=0
