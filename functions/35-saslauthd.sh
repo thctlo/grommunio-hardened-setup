@@ -26,10 +26,39 @@
 # package upgrade can offer to restore the maintainer's stock conffile
 # (START=no, no "-r"), silently undoing it. So every run of this step
 # re-checks and, if needed, re-applies ONLY those two things, using
-# Debian's own file layout and grommunio-setup's own values - never a
-# different OPTIONS structure, and never the "-m" mux path, which stays
-# Debian's own default (bridged into the chroot via the bind mount
-# below, not by changing where saslauthd puts its socket).
+# Debian's own file layout and grommunio-setup's own values.
+#
+# REDESIGNED 2026-11-17 - the "-m" mux path IS now actively managed too,
+# which this header used to explicitly say never happens. REAL BUG FOUND
+# LIVE: the previous design (saslauthd's own default socket dir,
+# /run/saslauthd, bridged into Postfix's chroot via a static /etc/fstab
+# bind mount) broke SMTP AUTH completely - zero successful logins for at
+# least a week - because saslauthd.service's own RuntimeDirectory=
+# directive recreates /run/saslauthd as a brand-new directory on every
+# service start. A bind mount binds to a directory INSTANCE, not a path,
+# so the existing mount kept silently pointing at the old, orphaned
+# instance (confirmed via `findmnt` showing the source as
+# "tmpfs[/saslauthd//deleted]") - `mountpoint -q` alone can't detect this,
+# it still reports "mounted". Confirmed this affects ONLY Postfix: no
+# other grommunio/gromox service references saslauthd or
+# /var/run/saslauthd at all (checked live 2026-11-17 - pam_gromox.so is
+# also wired into /etc/pam.d/grommunioauth and /etc/pam.d/grommuniochat,
+# but nothing currently invokes either of those through saslauthd; the
+# only live `pwcheck_method: saslauthd` config anywhere on the system is
+# Postfix's own /etc/postfix/sasl/smtpd.conf).
+#
+# Fixed at the root instead of patching around it again: "-m" now points
+# saslauthd's OWN socket directly at a path already inside Postfix's
+# chroot (/var/spool/postfix/var/run/saslauthd when submission/
+# submissions are chroot=y, Debian's own default /var/run/saslauthd
+# otherwise) - eliminating the bind mount (and the /etc/fstab entry,
+# cleaned up below) entirely. RuntimeDirectory=saslauthd still manages
+# its own, now-simply-unused /run/saslauthd independently - harmless,
+# nothing reads from there any more. Verified with a real end-to-end
+# SMTP AUTH login (throwaway mailbox + `openssl s_client -starttls
+# smtp` + AUTH PLAIN -> "235 2.7.0 Authentication successful"), not just
+# a socket-file-exists check - the old design's socket file could exist
+# and still be the wrong, stale one.
 #
 # The 'submission' (587, STARTTLS) master.cf block is a partial exception:
 # grommunio-setup DOES create this one itself (confirmed by reading its
@@ -73,11 +102,27 @@ fi
 log "Found grommunio-setup's existing PAM/SASL wiring (pam_gromox.so, pwcheck_method: saslauthd) — using it as-is."
 
 # ============================================================
-# Self-heal /etc/default/saslauthd's START= and OPTIONS's "-r" flag,
-# every run - see the file header for why this can't just be trusted
-# once and never re-checked. Backs up before any edit. Uses grommunio-
-# setup's own exact values; never touches the "-m" mux path.
+# Self-heal /etc/default/saslauthd's START=, OPTIONS's "-r" flag, and
+# (since 2026-11-17, see the file header) the "-m" mux path too, every
+# run - a package upgrade's conffile prompt or a saslauthd restart can
+# each silently undo one of these in their own way. Backs up before any
+# edit. Uses grommunio-setup's own exact values for START/-r.
 # ============================================================
+
+# Determine Postfix's actual chroot setting for the submission listener
+# up front - needed below to pick the right -m path. master.cf columns:
+# service type private unpriv chroot wakeup maxproc command.
+local submission_line chroot_col desired_sasl_mux_dir
+submission_line="$(grep -E '^submissions?[[:space:]]+inet' /etc/postfix/master.cf | head -n1 || true)"
+[[ -n "$submission_line" ]] || die "No active 'submission'/'submissions' (587) listener found in /etc/postfix/master.cf - expected grommunio-setup to have added one."
+chroot_col="$(awk '{print $5}' <<< "$submission_line")"
+log "Detected submission (587) listener, chroot column: '$chroot_col'"
+
+if [[ "$chroot_col" == "y" ]]; then
+    desired_sasl_mux_dir="/var/spool/postfix/var/run/saslauthd"
+else
+    desired_sasl_mux_dir="/var/run/saslauthd"
+fi
 
 SASLAUTHD_DEFAULT="/etc/default/saslauthd"
 [[ -f "$SASLAUTHD_DEFAULT" ]] || die "$SASLAUTHD_DEFAULT not found — sasl2-bin not installed as expected."
@@ -107,7 +152,75 @@ elif grep -qE '^OPTIONS="' "$SASLAUTHD_DEFAULT"; then
 else
     die "$SASLAUTHD_DEFAULT has no OPTIONS= line in the expected quoted form — not a normal sasl2-bin install, refusing to guess one."
 fi
+
+# -m: puts saslauthd's socket directly at a path Postfix can already see
+# (inside its own chroot, when chrooted) - see the file header for why
+# this replaced the old bind-mount design. The target directory must
+# exist with the right ownership BEFORE saslauthd starts, since nothing
+# else (no RuntimeDirectory=) creates this one automatically.
+mkdir -p "$desired_sasl_mux_dir"
+chown root:sasl "$desired_sasl_mux_dir"
+chmod 0755 "$desired_sasl_mux_dir"
+
+# REAL BUG FOUND AND FIXED 2026-11-17 while building this very check: an
+# unanchored `grep -F "-m <path>"` over the whole file also matches the
+# file's OWN commented-out documentation lines just above OPTIONS=
+# ("# Example for chroot Postfix users: ..."), which literally contain
+# this exact path as an example - a false "[ OK ] already correct"
+# every single time, never actually fixing anything. Anchored to the
+# live OPTIONS="..." line specifically instead, same as the existing -r
+# check just above.
+if grep -qE "^OPTIONS=\"[^\"]*-m[[:space:]]+${desired_sasl_mux_dir//\//\\/}([[:space:]]|\")" "$SASLAUTHD_DEFAULT"; then
+    log "[ OK ] OPTIONS already points -m at ${desired_sasl_mux_dir}."
+else
+    [[ "$SASLAUTHD_DEFAULT_CHANGED" -eq 1 ]] || backup_file "$SASLAUTHD_DEFAULT"
+    if grep -qE '^OPTIONS="[^"]*-m[[:space:]]+[^ "]+' "$SASLAUTHD_DEFAULT"; then
+        sed -i -E "/^OPTIONS=/s|-m[[:space:]]+[^ \"]+|-m ${desired_sasl_mux_dir}|" "$SASLAUTHD_DEFAULT"
+    else
+        sed -i -E "s/^OPTIONS=\"(.*)\"\$/OPTIONS=\"\1 -m ${desired_sasl_mux_dir}\"/" "$SASLAUTHD_DEFAULT"
+    fi
+    SASLAUTHD_DEFAULT_CHANGED=1
+    log "Set -m ${desired_sasl_mux_dir} in OPTIONS (was pointing elsewhere) - no bind mount needed any more."
+fi
 finalize_backup "$SASLAUTHD_DEFAULT"
+
+# REAL BUG FOUND LIVE 2026-11-17, right after deploying the -m change
+# above: saslauthd.service's own packaged unit hardcodes
+# PIDFile=/var/run/saslauthd/saslauthd.pid, completely independent of
+# OPTIONS' -m value - saslauthd itself writes BOTH its socket AND its
+# pidfile into whatever directory -m names, but systemd's PIDFile=
+# never follows that, so once -m points elsewhere, systemd can never
+# find the pidfile, waits for the Type=forking service to "finish
+# starting" that never comes, and kills an otherwise perfectly healthy
+# daemon after a timeout (confirmed: the daemon's own log showed
+# "listening on socket" successfully every time, systemd still killed
+# it). A drop-in overriding PIDFile= to match -m's own directory is
+# the fix - only needed when -m points somewhere other than the
+# package's own default.
+SASLAUTHD_PIDFILE_DROPIN_DIR="/etc/systemd/system/saslauthd.service.d"
+SASLAUTHD_PIDFILE_DROPIN="${SASLAUTHD_PIDFILE_DROPIN_DIR}/20-chroot-pidfile.conf"
+SASLAUTHD_PIDFILE_WANT="[Service]
+PIDFile=${desired_sasl_mux_dir}/saslauthd.pid
+"
+if [[ "$desired_sasl_mux_dir" == "/var/run/saslauthd" ]]; then
+    if [[ -f "$SASLAUTHD_PIDFILE_DROPIN" ]]; then
+        rm -f "$SASLAUTHD_PIDFILE_DROPIN"
+        systemctl daemon-reload
+        log "[ OK ] Removed the now-unnecessary PIDFile override (-m is the package default here)."
+    else
+        log "[ OK ] No PIDFile override needed (-m is the package default here)."
+    fi
+elif [[ -f "$SASLAUTHD_PIDFILE_DROPIN" ]] && cmp -s <(printf '%s' "$SASLAUTHD_PIDFILE_WANT") "$SASLAUTHD_PIDFILE_DROPIN"; then
+    log "[ OK ] PIDFile override already correct: ${SASLAUTHD_PIDFILE_DROPIN}."
+else
+    mkdir -p "$SASLAUTHD_PIDFILE_DROPIN_DIR"
+    backup_file "$SASLAUTHD_PIDFILE_DROPIN"
+    printf '%s' "$SASLAUTHD_PIDFILE_WANT" > "$SASLAUTHD_PIDFILE_DROPIN"
+    finalize_backup "$SASLAUTHD_PIDFILE_DROPIN"
+    systemctl daemon-reload
+    SASLAUTHD_DEFAULT_CHANGED=1
+    log "[ OK ] Wrote ${SASLAUTHD_PIDFILE_DROPIN} (PIDFile now matches -m's own directory)."
+fi
 
 # ============================================================
 # Ensure the 'submission' (587, STARTTLS) listener exists, matching
@@ -322,88 +435,26 @@ if [[ "$CHANGED_ANY" -eq 1 ]]; then
 fi
 
 # ============================================================
-# Detect Postfix's ACTUAL chroot setting for the submission service,
-# live, rather than assuming it matches what we saw during development.
+# One-time cleanup of the old bind-mount design this replaces (see the
+# file header for why). If the stale mount from a previous run of this
+# step is still active, unmount it; if the now-unnecessary /etc/fstab
+# entry is still there, remove it - otherwise a future reboot would
+# re-create a pointless (and, after a saslauthd restart, stale-again)
+# mount nothing reads from any more.
 # ============================================================
 
-local submission_line chroot_col
-submission_line="$(grep -E '^submissions?[[:space:]]+inet' /etc/postfix/master.cf | head -n1 || true)"
-
-if [[ -z "$submission_line" ]]; then
-    err "No active 'submission'/'submissions' (587) listener found in /etc/postfix/master.cf."
-    err "Expected grommunio-setup to have added one — nothing to fix SASL for."
-    return 1
+OLD_FSTAB_BIND_SRC="/var/run/saslauthd"
+OLD_FSTAB_BIND_DST="/var/spool/postfix/var/run/saslauthd"
+if mountpoint -q "$OLD_FSTAB_BIND_DST" 2>/dev/null; then
+    umount "$OLD_FSTAB_BIND_DST"
+    log "[ OK ] Unmounted the now-unnecessary old bind mount at $OLD_FSTAB_BIND_DST."
 fi
-
-# master.cf columns: service type private unpriv chroot wakeup maxproc command
-chroot_col="$(awk '{print $5}' <<< "$submission_line")"
-log "Detected submission (587) listener, chroot column: '$chroot_col'"
-
-# ============================================================
-# Determine saslauthd's actual socket directory from its own config,
-# rather than hardcoding /var/run/saslauthd.
-# ============================================================
-
-local sasl_options sasl_mux_dir
-sasl_options="$(grep -E '^OPTIONS=' /etc/default/saslauthd | sed -E 's/^OPTIONS="(.*)"$/\1/' || true)"
-# || true: -m is optional in OPTIONS - the fallback default right below
-# this already handles that case correctly.
-sasl_mux_dir="$(grep -oE '\-m[[:space:]]+[^ ]+' <<< "$sasl_options" | awk '{print $2}' || true)"
-sasl_mux_dir="${sasl_mux_dir:-/var/run/saslauthd}"
-log "saslauthd socket directory (from /etc/default/saslauthd OPTIONS): $sasl_mux_dir"
-
-# ============================================================
-# If submission is chrooted, the socket must be bind-mounted into the
-# jail — same pattern as the existing mysqld bind mount. If it is not
-# chrooted (the case grommunio-setup actually built: chroot=n), nothing
-# extra is needed; the socket at $sasl_mux_dir is directly reachable.
-#
-# ensure_saslauthd_chroot_mount compares the LIVE source directory's
-# inode against the chroot target's: a bind mount binds to a specific
-# directory INSTANCE, not a path, so if saslauthd ever recreates its own
-# run-directory (confirmed to happen on a plain `systemctl restart
-# saslauthd`, e.g. right after the self-heal above fixes a reverted
-# OPTIONS/START=, and presumably on every reboot too, since /var/run is
-# tmpfs), the existing mount silently starts showing the OLD, now-empty
-# directory instead of the new socket - `mountpoint -q` alone can't see
-# this, since the mount itself is still technically active. Called both
-# here and again after the restart below, so a restart that happens
-# AFTER this first call can't leave the mount stale for the rest of the
-# run.
-# ============================================================
-
-ensure_saslauthd_chroot_mount()
-{
-    [[ "$chroot_col" == "y" ]] || { log "submission is not chrooted (chroot=$chroot_col) — no bind mount needed, saslauthd's default socket path is directly reachable."; return 0; }
-
-    local chroot_target="/var/spool/postfix${sasl_mux_dir}"
-    mkdir -p "$chroot_target"
-
-    if mountpoint -q "$chroot_target"; then
-        if [[ "$(stat -c %i "$sasl_mux_dir" 2>/dev/null)" == "$(stat -c %i "$chroot_target" 2>/dev/null)" ]]; then
-            log "[ OK ] $chroot_target already mounted and matches the current $sasl_mux_dir."
-            return 0
-        fi
-        log "$chroot_target is mounted but STALE (saslauthd recreated $sasl_mux_dir since the last mount) — remounting..."
-        umount "$chroot_target"
-    else
-        log "submission is chrooted — bind-mounting saslauthd socket into the jail: $chroot_target"
-    fi
-
-    mount "$chroot_target"
-    log "Mounted $chroot_target"
-}
-
-if [[ "$chroot_col" == "y" ]] && ! grep -qF "/var/spool/postfix${sasl_mux_dir}" /etc/fstab; then
+if grep -qF "${OLD_FSTAB_BIND_SRC}	${OLD_FSTAB_BIND_DST}" /etc/fstab; then
     backup_file /etc/fstab
-    echo "${sasl_mux_dir}	/var/spool/postfix${sasl_mux_dir}	bind	defaults,bind	0	0" >> /etc/fstab
+    sed -i "\\|^${OLD_FSTAB_BIND_SRC}[[:space:]]\\+${OLD_FSTAB_BIND_DST//\//\\/}[[:space:]]|d" /etc/fstab
     finalize_backup /etc/fstab
-    log "Added fstab bind mount: $sasl_mux_dir -> /var/spool/postfix${sasl_mux_dir}"
-elif [[ "$chroot_col" == "y" ]]; then
-    log "fstab bind mount for /var/spool/postfix${sasl_mux_dir} already present."
+    log "[ OK ] Removed the now-unnecessary old bind-mount entry from /etc/fstab."
 fi
-
-ensure_saslauthd_chroot_mount
 
 # ============================================================
 # Enable and start saslauthd (the actual missing piece).
@@ -422,12 +473,6 @@ else
     log "Starting saslauthd..."
     systemctl start saslauthd
 fi
-
-# A restart (just above, or the plain 'systemctl start' on a fresh daemon)
-# can recreate saslauthd's run-directory, which would silently invalidate
-# the bind mount set up earlier in this same run — re-check and remount
-# if needed, now that the daemon's final socket directory instance exists.
-ensure_saslauthd_chroot_mount
 
 # ============================================================
 # Postfix SASL mechanisms. saslauthd verifies passwords through PAM, and PAM
@@ -497,18 +542,41 @@ else
     verify_failed=1
 fi
 
-if [[ -S "${sasl_mux_dir}/mux" ]]; then
-    log "[ OK ] saslauthd socket present: ${sasl_mux_dir}/mux"
+if [[ -S "${desired_sasl_mux_dir}/mux" ]]; then
+    log "[ OK ] saslauthd socket present where Postfix expects it: ${desired_sasl_mux_dir}/mux"
 else
-    err "[FAIL] saslauthd socket not found at ${sasl_mux_dir}/mux"
+    err "[FAIL] saslauthd socket not found at ${desired_sasl_mux_dir}/mux"
     verify_failed=1
 fi
 
-if [[ "$chroot_col" == "y" ]]; then
-    if [[ -S "/var/spool/postfix${sasl_mux_dir}/mux" ]]; then
-        log "[ OK ] saslauthd socket visible inside the postfix chroot."
+# A socket file existing is not proof it's the RIGHT one - the old
+# bind-mount design's socket file could exist and still be stale (see
+# the file header). The only real proof is a genuine end-to-end SMTP
+# AUTH login, via a throwaway test mailbox (same pattern as
+# 34-postfix-hardening.sh's own live verification tests) and a raw
+# AUTH PLAIN exchange over STARTTLS on the submission (587) port.
+if [[ "$verify_failed" -eq 0 ]]; then
+    local test_domain test_user test_full test_pass authstr auth_reply
+    test_domain="$(postconf -h myhostname | cut -d. -f2-)"
+    test_user="saslauthdtest-$(date +%s)-$$"
+    test_full="${test_user}@${test_domain}"
+    test_pass="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
+
+    if grommunio-admin user create "$test_full" >/dev/null 2>&1 \
+        && grommunio-admin passwd "$test_full" --password "$test_pass" >/dev/null 2>&1; then
+        authstr="$(printf '\0%s\0%s' "$test_full" "$test_pass" | base64 -w0)"
+        auth_reply="$( { sleep 1; echo "EHLO test.example"; sleep 1; echo "AUTH PLAIN ${authstr}"; sleep 1; echo QUIT; } \
+            | openssl s_client -starttls smtp -connect 127.0.0.1:587 -quiet 2>/dev/null )"
+        grommunio-admin user delete "$test_full" -y >/dev/null 2>&1
+
+        if grep -q '^235 ' <<< "$auth_reply"; then
+            log "[ OK ] Verified live: a real SMTP AUTH login on submission (587) succeeds."
+        else
+            err "[FAIL] A real SMTP AUTH login on submission (587) did not succeed: ${auth_reply}"
+            verify_failed=1
+        fi
     else
-        err "[FAIL] saslauthd socket not visible inside the postfix chroot."
+        err "[FAIL] Could not create the throwaway test mailbox ${test_full} to verify a real login."
         verify_failed=1
     fi
 fi
