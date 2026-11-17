@@ -87,6 +87,12 @@
 #                                                  admin@<first active
 #                                                  domain> - the hub
 #                                                  mailbox step 31 creates.
+#   -scheme <rollover|issuer>                      Which double-TLSA
+#                                                  rollover scheme to use -
+#                                                  see DANE_SCHEME's own
+#                                                  comment below for the
+#                                                  full explanation.
+#                                                  Default: rollover.
 #
 # --setup writes real DNS zone records (via transip-dns). The operator
 # runs this command themselves - an agent must never run --setup (this is
@@ -122,6 +128,36 @@ DANE_TLSA_SCRIPT="${SCRIPT_DIR}/update-dane-tlsa.sh"
 CERT_NAME="$(discover_cert_name)"
 DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/75-update-dane-tlsa"
 TTL=3600
+
+# DANE_SCHEME: which of Internet.nl's own two recommended double-TLSA
+# rollover schemes to publish - always exactly 2 records total, never
+# a combination of both (2026-11-17, corrected after first proposing
+# 4 records - see below). Overridable via the environment or -scheme.
+#   rollover (default): "3 1 1" (current leaf key) + "3 1 1" (the
+#     immediately PRECEDING leaf key, from certbot's own archive/) -
+#     Internet.nl's "Current + Next" scheme, reinterpreted as
+#     "Current + Previous" since this project has no planned future
+#     key to pre-announce (reuse_key=True is meant to keep the key
+#     stable indefinitely). Chosen as the default: it protects
+#     against ANY leaf-key change, planned or not - directly covering
+#     the exact failure mode hit twice live this same day (the
+#     reuse_key regression silently generating a new key during a
+#     certificate --expand).
+#   issuer: "3 1 1" (current leaf key) + "2 1 1" (current issuing
+#     intermediate CA) - Internet.nl's "Current + Issuer CA" scheme,
+#     this project's original choice. Protects against Let's
+#     Encrypt's own intermediate certificate rotating, but NOT
+#     against an unexpected leaf-key change - no second "3 1 1" value
+#     to fall back on if that happens.
+#
+# REAL BUG FOUND 2026-11-17: the first version of this redesign
+# applied the "current + previous" idea to EACH usage-type
+# independently (2x "3 1 1" AND 2x "2 1 1"), publishing 4 TLSA
+# records total - neither of Internet.nl's own two recommended
+# schemes, which the test's own text warns against ("other types...
+# will generally be more error prone and less interoperable").
+# Corrected before ever being run against live DNS.
+DANE_SCHEME="${DANE_SCHEME:-rollover}"
 
 show_help()
 {
@@ -169,20 +205,66 @@ expected_tlsa_ta_for()
     echo "2 1 1 ${hash}"
 }
 
-# tlsa_lookup <domain> <label> <usage_prefix>: prints the matching
-# TLSA record's rrdata (e.g. "2 1 1 <hash>"), or nothing if none
-# exists. Prefers transip-dns list - the authoritative source,
-# queried live with zero caching - over resolvectl's own DNS-based
-# lookup, whenever TransIP credentials are available for this
-# domain. REAL BUG FOUND 2026-11-16: --status used resolvectl only,
-# which can lag the true state by up to the record's own TTL (a
-# resolver cache, including this server's own) - right after a
-# --setup run that had genuinely just succeeded, --status still
-# showed [FAIL] for several minutes even though `transip-dns list`
-# already showed the correct value. Falls back to resolvectl only
-# when there is no TransIP access to query directly (a different
-# registrar) - that case has no zero-caching alternative available.
-tlsa_lookup()
+# expected_tlsa_prev_for / expected_tlsa_ta_prev_for: same as the two
+# functions above, but computed from certbot's own PREVIOUS archive
+# generation (the one just superseded, if any) instead of the live
+# one - part of the "N and N-1" rotation added 2026-11-17, see the
+# file header's "DANE rollover scheme" section for the full reasoning.
+# certbot already keeps every past cert/fullchain generation under
+# archive/, named identically one number lower, so "the previous
+# value" needs no state tracking of its own: resolve the live symlink
+# to find the current generation number, then read the file one
+# number below it. Prints nothing if that can't be determined (e.g.
+# this is the very first issuance, with no N-1 at all) - callers must
+# check for that.
+_dane_prev_generation_file()
+{
+    local kind="$1" resolved
+    resolved="$(readlink -f "/etc/letsencrypt/live/${CERT_NAME}/cert.pem" 2>/dev/null || true)"
+    [[ "$resolved" =~ ^(.*)/cert([0-9]+)\.pem$ ]] || return 1
+    local archive_dir="${BASH_REMATCH[1]}" cur_gen="${BASH_REMATCH[2]}"
+    [[ "$cur_gen" -gt 1 ]] || return 1
+    local prev_gen=$((cur_gen - 1))
+    local f="${archive_dir}/${kind}${prev_gen}.pem"
+    [[ -f "$f" ]] || return 1
+    echo "$f"
+}
+expected_tlsa_prev_for()
+{
+    local f hash
+    f="$(_dane_prev_generation_file cert)" || return 0
+    hash="$(openssl x509 -in "$f" -noout -pubkey 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -hex 2>/dev/null | sed 's/^.*= //')"
+    [[ "${#hash}" -eq 64 ]] || return 0
+    echo "3 1 1 ${hash}"
+}
+expected_tlsa_ta_prev_for()
+{
+    local f hash
+    f="$(_dane_prev_generation_file fullchain)" || return 0
+    hash="$(awk -v n=2 '/-----BEGIN CERTIFICATE-----/{c++} c==n{print} /-----END CERTIFICATE-----/{if(c==n) exit}' "$f" \
+        | openssl x509 -noout -pubkey 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -hex 2>/dev/null | sed 's/^.*= //')"
+    [[ "${#hash}" -eq 64 ]] || return 0
+    echo "2 1 1 ${hash}"
+}
+
+# tlsa_lookup_all <domain> <label> <usage_prefix>: prints EVERY
+# matching TLSA record's rrdata for this usage-type, one per line (0,
+# 1 or 2 lines - the "N and N-1" rotation keeps at most 2). Prefers
+# transip-dns list - the authoritative source, queried live with zero
+# caching - over resolvectl's own DNS-based lookup, whenever TransIP
+# credentials are available for this domain. REAL BUG FOUND
+# 2026-11-16: --status used resolvectl only, which can lag the true
+# state by up to the record's own TTL (a resolver cache, including
+# this server's own) - right after a --setup run that had genuinely
+# just succeeded, --status still showed [FAIL] for several minutes
+# even though `transip-dns list` already showed the correct value.
+# Falls back to resolvectl (first match only - it cannot reliably
+# enumerate multiple same-name+type records) only when there is no
+# TransIP access to query directly (a different registrar) - that
+# case has no zero-caching, multi-record-aware alternative available.
+tlsa_lookup_all()
 {
     local domain="$1" label="$2" usage_prefix="$3"
     if have_transip_creds "$domain"; then
@@ -194,9 +276,16 @@ tlsa_lookup()
     else
         local out
         if out="$(resolvectl query --type=TLSA "_25._tcp.${label}.${domain}" 2>/dev/null)"; then
-            grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | grep -E "^${usage_prefix} " | head -1 || true
+            grep -oE '[0-9]+ [0-9]+ [0-9]+ [0-9a-fA-F]+' <<< "$out" | grep -E "^${usage_prefix} " || true
         fi
     fi
+}
+
+# tlsa_lookup <domain> <label> <usage_prefix>: first match only, kept
+# for any caller that genuinely wants just one value.
+tlsa_lookup()
+{
+    tlsa_lookup_all "$@" | head -1
 }
 
 # ============================================================
@@ -268,44 +357,86 @@ cmd_status()
         failed=$((failed + 1))
     fi
 
-    # Two TLSA records now coexist at the same name (DANE-EE "3 1 1"
-    # for the leaf key, DANE-TA "2 1 1" for the issuing intermediate -
-    # the "Current + Issuer CA" rollover scheme). tlsa_lookup() (see
-    # its own header) prefers transip-dns list - zero caching - over
+    # tlsa_lookup_all() prefers transip-dns list - zero caching - over
     # DNS resolution, so a --setup run's result shows correctly here
     # immediately, not just after the record's own TTL expires
     # everywhere.
-    local tlsa_live="" want_tlsa=""
-    tlsa_live="$(tlsa_lookup "$domain" "$label" "3")"
-    want_tlsa="$(expected_tlsa_for)"
-    # REAL BUG FOUND 2026-11-15: this used to only check whether ANY TLSA
-    # record existed at this name - never whether its VALUE still matches
-    # the current certificate's key. Confirmed live: a record published
-    # against an earlier key (before reuse_key took effect) was reported
-    # "[ OK ] ... already published" every run since, even though it no
-    # longer matched the live certificate at all - the exact kind of
-    # silent drift DANE is supposed to prevent, not cause.
-    if [[ -z "$tlsa_live" ]]; then
-        failline "No DANE-EE (3 1 1) TLSA record published yet at _25._tcp.${target}."
-        failed=$((failed + 1))
-    elif [[ -n "$want_tlsa" && "${tlsa_live,,}" != "${want_tlsa,,}" ]]; then
-        failline "DANE-EE TLSA record is stale: published \"${tlsa_live}\", current certificate needs \"${want_tlsa}\" - run --setup to update it."
-        failed=$((failed + 1))
-    else
-        okline "DANE-EE (3 1 1) TLSA record published and matches the current certificate: ${tlsa_live}"
-    fi
+    #
+    # check_tlsa_pair <usage_prefix> <description> <new_value> <prev_value>:
+    # compares the live set against the desired set ({new_value}, or
+    # {new_value, prev_value} when prev_value is non-empty and
+    # actually differs) in BOTH directions - every live value must be
+    # desired (catches stale cruft) AND every desired value must be
+    # live (catches a missing "new" or a missing "prev" the active
+    # scheme expects). REAL BUG FOUND 2026-11-17 while first testing
+    # this live: the original version only checked the first
+    # direction, so "new" published but "prev" still missing (the
+    # live state right after switching DANE_SCHEME to "rollover") was
+    # silently treated as neither OK nor FAIL - no line printed at
+    # all for that usage-type.
+    check_tlsa_pair()
+    {
+        local usage_prefix="$1" description="$2" new_value="$3" prev_value="$4"
+        local -a live=()
+        while IFS= read -r line; do [[ -n "$line" ]] && live+=("$line"); done \
+            < <(tlsa_lookup_all "$domain" "$label" "$usage_prefix")
 
-    local tlsa_ta_live="" want_tlsa_ta=""
-    tlsa_ta_live="$(tlsa_lookup "$domain" "$label" "2")"
-    want_tlsa_ta="$(expected_tlsa_ta_for)"
-    if [[ -z "$tlsa_ta_live" ]]; then
-        failline "No DANE-TA (2 1 1, issuer CA / rollover scheme) TLSA record published yet at _25._tcp.${target}."
-        failed=$((failed + 1))
-    elif [[ -n "$want_tlsa_ta" && "${tlsa_ta_live,,}" != "${want_tlsa_ta,,}" ]]; then
-        failline "DANE-TA TLSA record is stale: published \"${tlsa_ta_live}\", current intermediate CA needs \"${want_tlsa_ta}\" - run --setup to update it."
-        failed=$((failed + 1))
+        if [[ "${#live[@]}" -eq 0 ]]; then
+            failline "No ${description} TLSA record published yet at _25._tcp.${target}."
+            failed=$((failed + 1))
+            return
+        fi
+
+        local -a desired=("$new_value")
+        [[ -n "$prev_value" && "$prev_value" != "$new_value" ]] && desired+=("$prev_value")
+
+        local have want found all_match=1
+        for have in "${live[@]}"; do
+            found=0
+            for want in "${desired[@]}"; do [[ "${have,,}" == "${want,,}" ]] && { found=1; break; }; done
+            if [[ "$found" -eq 0 ]]; then
+                failline "${description} TLSA record \"${have}\" is stale (no longer the current or previous value) - run --setup to clean it up."
+                failed=$((failed + 1))
+                all_match=0
+            fi
+        done
+
+        for want in "${desired[@]}"; do
+            found=0
+            for have in "${live[@]}"; do [[ "${have,,}" == "${want,,}" ]] && { found=1; break; }; done
+            if [[ "$found" -eq 0 ]]; then
+                failline "${description} is missing \"${want}\" - published {${live[*]}}, run --setup to add it."
+                failed=$((failed + 1))
+                all_match=0
+            fi
+        done
+
+        [[ "$all_match" -eq 1 ]] && okline "${description} TLSA record(s) published and match the desired set: ${live[*]}"
+        # REAL BUG FOUND 2026-11-17: without this, the function's own
+        # exit status is whatever the `[[ ... ]] && okline ...` line
+        # above evaluated to - 1 (false) every time all_match was 0,
+        # i.e. every time a [FAIL] was found. check_tlsa_pair is
+        # called bare (no `||` guard - --status must keep checking
+        # everything else after one check fails, not abort), so under
+        # set -e that silently killed the whole script right after
+        # the first [FAIL] line - confirmed live: --status printed
+        # exactly one [FAIL] and then stopped, never reaching the
+        # DANE_DOMAINS/deploy-hook checks or the summary at all.
+        return 0
+    }
+
+    okline "Rollover scheme: ${DANE_SCHEME} ($( [[ "$DANE_SCHEME" == "rollover" ]] && echo '"3 1 1" current + "3 1 1" previous' || echo '"3 1 1" current + "2 1 1" issuer CA' ))."
+    if [[ "$DANE_SCHEME" == "rollover" ]]; then
+        check_tlsa_pair "3" "DANE-EE (3 1 1, current + previous)" "$(expected_tlsa_for)" "$(expected_tlsa_prev_for)"
+        local leftover_ta
+        leftover_ta="$(tlsa_lookup_all "$domain" "$label" "2")"
+        if [[ -n "$leftover_ta" ]]; then
+            failline "Found leftover DANE-TA (2 1 1) record(s) from the 'issuer' scheme while running 'rollover' - run --setup to clean up: ${leftover_ta}"
+            failed=$((failed + 1))
+        fi
     else
-        okline "DANE-TA (2 1 1) TLSA record published and matches the current issuing CA: ${tlsa_ta_live}"
+        check_tlsa_pair "3" "DANE-EE (3 1 1)" "$(expected_tlsa_for)" ""
+        check_tlsa_pair "2" "DANE-TA (2 1 1, issuer CA)" "$(expected_tlsa_ta_for)" ""
     fi
 
     if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then
@@ -389,96 +520,153 @@ cmd_setup()
     log "Ensuring the certificate covers ${target} and reuse_key is set..."
     "${SCRIPT_DIR}/manage-certs.sh" --all
 
-    # publish_tlsa_entry <usage_prefix> <description> <want_value>:
-    # shared add/update/skip logic for ONE TLSA usage-type at
-    # _25._tcp.<label>.<domain> - called once for DANE-EE ("3 1 1",
-    # the leaf key, existing behaviour) and once for DANE-TA
-    # ("2 1 1", the issuing intermediate CA) - the "Current + Issuer
-    # CA" rollover scheme the Internet.nl DANE test recommends. Both
-    # entries share the same name+type (TLSA), so TransIP requires
-    # them to share one TTL too (confirmed via its own 406 error
-    # wording) - transip_live_ttl_for's plain name+type match is
-    # therefore always correct here, regardless of which usage-type
-    # entry it happens to find first.
-    publish_tlsa_entry()
+    # publish_tlsa_pair <usage_prefix> <description> <new_value> <prev_value>:
+    # "N and N-1" rotation reconciliation for ONE TLSA usage-type at
+    # _25._tcp.<label>.<domain> - called once for DANE-EE ("3 1 1")
+    # and once for DANE-TA ("2 1 1"). Desired end state is
+    # {new_value} alone, or {new_value, prev_value} when prev_value is
+    # non-empty and actually differs (the common case, thanks to
+    # reuse_key, is that they're identical - nothing extra to add
+    # there). Whatever is currently published but no longer in that
+    # desired set gets deleted. See the file header's "DANE rollover
+    # scheme" section for the full history of why this replaced a
+    # straight add/update design.
+    #
+    # REAL BUG FOUND AND FIXED 2026-11-17: the previous version used
+    # `transip-dns update` (TransIP's PATCH endpoint) to change an
+    # existing record's content in place. Re-reading transip_rest's
+    # own update_dns_entry() (and the TransIP API docs it quotes)
+    # confirmed PATCH identifies the record to change by
+    # name+expire+type ONLY, never content - fine with exactly one
+    # record of a usage-type at a name, but as soon as TWO coexist at
+    # the same name+ttl (this exact rollover scheme, confirmed live
+    # the moment a real key rotation needed updating one of them),
+    # TransIP can no longer tell them apart and correctly refuses with
+    # 406 "Multiple matches found" - leaving the old, wrong value
+    # live. delete's own request includes the exact content being
+    # removed, so it never has this ambiguity; every change here is
+    # now delete(exact old content) + add(new content), never
+    # update/PATCH.
+    publish_tlsa_pair()
     {
-        local usage_prefix="$1" description="$2" want_value="$3"
-        local live=""
-        live="$(tlsa_lookup "$domain" "$label" "$usage_prefix")"
-        [[ -n "$want_value" ]] || die "Could not compute the expected ${description} value - refusing to publish."
+        local usage_prefix="$1" description="$2" new_value="$3" prev_value="$4"
+        [[ -n "$new_value" ]] || die "Could not compute the expected ${description} value - refusing to publish."
 
-        if [[ -z "$live" ]]; then
-            if have_transip_creds "$domain"; then
-                log "Computing and publishing the initial ${description} record..."
-                require_cmd transip-dns
-                local user key_file; user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
-                # REAL BUG FOUND 2026-11-16: a SIBLING TLSA entry (the
-                # other usage-type) can already exist at this exact
-                # name - TransIP requires every record in that rrset to
-                # share one TTL, so adding this one with the script's
-                # own fixed $TTL default fails outright (406 "the
-                # expire of all records in an rrset must be all the
-                # same") whenever that sibling's own live TTL differs.
-                # Use the sibling's live TTL when one exists, $TTL only
-                # when this is truly the first TLSA record at this name.
-                local add_ttl="$TTL" sibling_ttl
-                sibling_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
-                [[ -n "$sibling_ttl" ]] && add_ttl="$sibling_ttl"
-                # Also found in the same incident: this add's own exit
-                # status was never checked, so a failed add (like the
-                # TTL-mismatch 406 above) was still reported "[ OK ]
-                # Published" - confirmed live by a --status run right
-                # after showing the record was never actually there.
-                if ! transip-dns --username "$user" --key-file "$key_file" \
-                    add "$domain" "_25._tcp.${label}" TLSA "$want_value" --ttl "$add_ttl"; then
-                    err "Could not add the new ${description} record for _25._tcp.${target}."
-                    return 1
-                fi
-                log "[ OK ] Published ${description}: ${want_value}"
-                log "      TTL is ${add_ttl}s - resolvers (including this server's own cache) may keep"
-                log "      answering with no/old data for up to that long. A --status run inside"
-                log "      this window can still show [FAIL] even though the record is correct."
-            else
-                err "No ${description} record exists and no TransIP credentials are available to publish one."
-                err "Publish as: _25._tcp.${target}  TLSA  ${want_value}"
-                return 1
+        local -a desired=("$new_value")
+        [[ -n "$prev_value" && "$prev_value" != "$new_value" ]] && desired+=("$prev_value")
+
+        local -a live=()
+        while IFS= read -r line; do [[ -n "$line" ]] && live+=("$line"); done \
+            < <(tlsa_lookup_all "$domain" "$label" "$usage_prefix")
+
+        local rc=0 want have found i
+
+        for want in "${desired[@]}"; do
+            found=0
+            for have in "${live[@]}"; do [[ "${have,,}" == "${want,,}" ]] && { found=1; break; }; done
+            [[ "$found" -eq 1 ]] && continue
+            if ! have_transip_creds "$domain"; then
+                err "${description} needs ${want} published and no TransIP credentials are available."
+                err "Add: _25._tcp.${target}  TLSA  ${want}"
+                rc=1
+                continue
             fi
-        elif [[ "${live,,}" != "${want_value,,}" ]]; then
-            # REAL BUG FOUND 2026-11-15: this branch didn't exist at all -
-            # any existing record, however stale, was reported "already
-            # published" and left untouched forever. Using transip-dns
-            # update (name/type/ttl must match the live record exactly,
-            # only content changes), not add - add would create a SECOND,
-            # conflicting TLSA record alongside the stale one instead of
-            # replacing it.
-            if have_transip_creds "$domain"; then
-                log "Published ${description} record is stale (${live}) - updating to match the current certificate..."
-                require_cmd transip-dns
-                local user key_file live_ttl
-                user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
-                live_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
-                [[ -n "$live_ttl" ]] || die "Could not find the live TLSA record's own TTL via transip-dns list - refusing to guess one for update."
-                transip-dns --username "$user" --key-file "$key_file" \
-                    update "$domain" "_25._tcp.${label}" TLSA "$want_value" --ttl "$live_ttl"
-                log "[ OK ] Updated ${description} record: ${live} -> ${want_value}"
-                log "      TTL is ${live_ttl}s - resolvers (including this server's own cache) may"
-                log "      keep answering with the OLD value for up to that long. A --status run"
-                log "      inside this window can still show [FAIL] stale even though TransIP's"
-                log "      own answer (transip-dns list ${domain}) is already correct."
-            else
-                err "Published ${description} record is stale and no TransIP credentials are available to update it."
-                err "Current:   _25._tcp.${target}  TLSA  ${live}"
-                err "Should be: _25._tcp.${target}  TLSA  ${want_value}"
-                return 1
+            require_cmd transip-dns
+            local user key_file add_ttl sibling_ttl
+            user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
+            # A SIBLING TLSA entry (same or other usage-type) can
+            # already exist at this exact name - TransIP requires
+            # every record in that rrset to share one TTL, so adding
+            # this one with the script's own fixed $TTL default fails
+            # outright (406) whenever that sibling's own live TTL
+            # differs. Use the sibling's live TTL when one exists,
+            # $TTL only when this is truly the first TLSA record here.
+            add_ttl="$TTL"
+            sibling_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
+            [[ -n "$sibling_ttl" ]] && add_ttl="$sibling_ttl"
+            if ! transip-dns --username "$user" --key-file "$key_file" \
+                add "$domain" "_25._tcp.${label}" TLSA "$want" --ttl "$add_ttl"; then
+                err "Could not add ${description} record '${want}' for _25._tcp.${target}."
+                rc=1
+                continue
             fi
-        else
-            [[ "$BRIEF" -eq 1 ]] || log "[ OK ] ${description} record already published and matches the current certificate: ${live}"
+            log "[ OK ] Published ${description}: ${want}"
+        done
+
+        for ((i = 0; i < ${#live[@]}; i++)); do
+            have="${live[$i]}"
+            found=0
+            for want in "${desired[@]}"; do [[ "${have,,}" == "${want,,}" ]] && { found=1; break; }; done
+            [[ "$found" -eq 1 ]] && continue
+            if ! have_transip_creds "$domain"; then
+                err "${description} has a superseded record that needs removing and no TransIP credentials are available."
+                err "Remove: _25._tcp.${target}  TLSA  ${have}"
+                rc=1
+                continue
+            fi
+            require_cmd transip-dns
+            local user2 key_file2 have_ttl
+            user2="$(transip_user_for "$domain")"; key_file2="$(transip_key_for "$domain")"
+            have_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
+            if ! transip-dns --username "$user2" --key-file "$key_file2" \
+                delete "$domain" "_25._tcp.${label}" TLSA "$have" --ttl "${have_ttl:-$TTL}"; then
+                err "Could not remove the superseded ${description} record '${have}' for _25._tcp.${target}."
+                rc=1
+                continue
+            fi
+            log "[ OK ] Removed superseded ${description} record: ${have}"
+        done
+
+        if [[ "$rc" -eq 0 ]]; then
+            [[ "$BRIEF" -eq 1 ]] || log "[ OK ] ${description} now matches the desired set exactly."
+            log "      Resolvers (including this server's own cache) may keep answering with"
+            log "      old/missing data for up to the record's own TTL. A --status run inside"
+            log "      this window can still show [FAIL] even though TransIP's own answer is"
+            log "      already correct."
         fi
-        return 0
+        return "$rc"
     }
 
-    publish_tlsa_entry "3" "DANE-EE (3 1 1)" "$(expected_tlsa_for)" || return 1
-    publish_tlsa_entry "2" "DANE-TA (2 1 1, issuer CA)" "$(expected_tlsa_ta_for)" || return 1
+    # remove_usage_type <usage_prefix> <description>: deletes every
+    # live TLSA record of this usage-type at this name, for cleaning
+    # up the OTHER scheme's record(s) left behind by a scheme switch
+    # (e.g. an existing "2 1 1" DANE-TA entry when now running in
+    # "rollover" mode, which never publishes one at all).
+    remove_usage_type()
+    {
+        local usage_prefix="$1" description="$2"
+        local -a live=()
+        while IFS= read -r line; do [[ -n "$line" ]] && live+=("$line"); done \
+            < <(tlsa_lookup_all "$domain" "$label" "$usage_prefix")
+        [[ "${#live[@]}" -gt 0 ]] || return 0
+        if ! have_transip_creds "$domain"; then
+            err "${description} has ${#live[@]} record(s) left over from a scheme switch and no TransIP credentials are available to remove them."
+            return 1
+        fi
+        require_cmd transip-dns
+        local user key_file have_ttl have rc=0
+        user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
+        for have in "${live[@]}"; do
+            have_ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
+            if ! transip-dns --username "$user" --key-file "$key_file" \
+                delete "$domain" "_25._tcp.${label}" TLSA "$have" --ttl "${have_ttl:-$TTL}"; then
+                err "Could not remove the leftover ${description} record '${have}' from the previous scheme."
+                rc=1
+                continue
+            fi
+            log "[ OK ] Removed leftover ${description} record from the previous scheme: ${have}"
+        done
+        return "$rc"
+    }
+
+    log "Rollover scheme: ${DANE_SCHEME}."
+    if [[ "$DANE_SCHEME" == "rollover" ]]; then
+        publish_tlsa_pair "3" "DANE-EE (3 1 1, current + previous)" "$(expected_tlsa_for)" "$(expected_tlsa_prev_for)" || return 1
+        remove_usage_type "2" "DANE-TA (2 1 1)" || return 1
+    else
+        publish_tlsa_pair "3" "DANE-EE (3 1 1)" "$(expected_tlsa_for)" "" || return 1
+        publish_tlsa_pair "2" "DANE-TA (2 1 1, issuer CA)" "$(expected_tlsa_ta_for)" "" || return 1
+    fi
 
     if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then
         [[ "$BRIEF" -eq 1 ]] || log "[ OK ] ${domain} already in update-dane-tlsa.sh's DANE_DOMAINS."
@@ -552,6 +740,9 @@ while [[ $# -gt 0 ]]; do
         -domain)
             [[ -n "${2:-}" ]] || die "-domain needs a value."
             TARGET_DOMAIN="$2"; shift 2 ;;
+        -scheme)
+            [[ "${2:-}" == "rollover" || "${2:-}" == "issuer" ]] || die "-scheme must be 'rollover' or 'issuer' (got: '${2:-}')."
+            DANE_SCHEME="$2"; shift 2 ;;
         --status)
             ACTION="status"; shift ;;
         --setup)

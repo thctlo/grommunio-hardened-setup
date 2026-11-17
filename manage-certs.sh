@@ -211,7 +211,18 @@ cmd_generate()
     local h
     for h in "${wanted[@]}"; do d_args+=(-d "$h"); done
 
-    certbot certonly --cert-name "$CERT_NAME" --nginx --expand \
+    # REAL BUG FOUND LIVE 2026-11-17: writing reuse_key = True into the
+    # renewal conf file (above) is not enough on its own - confirmed
+    # twice now that certbot's --expand path does not reliably honor
+    # that saved value (the man page frames --reuse-key as something
+    # that applies "when renewing"; --expand is documented separately
+    # as "expand and replace", a subtly different code path), silently
+    # generating a brand-new key even with no authenticator switch
+    # involved. Passing --reuse-key explicitly on the command line
+    # every time closes this - the config-file write above stays, since
+    # certbot.timer's own plain `certbot renew` (no --expand) does read
+    # it reliably.
+    certbot certonly --cert-name "$CERT_NAME" --nginx --expand --reuse-key \
         --non-interactive --agree-tos "${d_args[@]}" \
         || die "certbot could not issue/expand the certificate '$CERT_NAME'."
 
