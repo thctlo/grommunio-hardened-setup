@@ -142,7 +142,19 @@ DANE_TLSA_SCRIPT="${SCRIPT_DIR}/update-dane-tlsa.sh"
 # data, right after manage-certs.sh had just confirmed setting
 # reuse_key on the REAL certificate two lines above in the same run.
 CERT_NAME="$(discover_cert_name)"
-DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/75-update-dane-tlsa"
+# Named to sort BEFORE 70-sync-ssl-key (34-postfix-tls.sh) in certbot's
+# own lexicographic deploy-hook execution order - added 2026-11-19
+# after a review question about a simultaneous leaf-key + issuer-CA
+# change: DNS must be updated BEFORE any service starts serving the
+# renewed certificate, or there is a real (if brief) window where the
+# live cert matches neither the old nor the new DNS record. The
+# previous name (75-...) ran AFTER 70-sync-ssl-key's nginx reload -
+# backwards from best practice. Reading the certificate files
+# themselves is still safe this early: certbot writes them to
+# /etc/letsencrypt/live/ before running ANY deploy-hook, well before
+# this hook or 70-sync-ssl-key/80-grommunio-certbot-deploy-hook make
+# any SERVICE actually start using them.
+DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/60-update-dane-tlsa"
 TTL=3600
 
 # DANE_SCHEME: which of Internet.nl's own two recommended double-TLSA
@@ -159,6 +171,20 @@ TTL=3600
 #     the exact failure mode hit twice live this same day (the
 #     reuse_key regression silently generating a new key during a
 #     certificate --expand).
+#
+#     FALLBACK (added 2026-11-19): as long as reuse_key keeps holding,
+#     the leaf key NEVER changes across a plain renewal, so a "previous
+#     generation" never exists - this is the normal, ONGOING state,
+#     not just a brief window right after setup. Publishing only ONE
+#     "3 1 1" record then would leave zero redundancy, which is
+#     neither of Internet.nl's two recommended schemes. cmd_setup/
+#     cmd_status/cmd_report (and update-dane-tlsa.sh's own copy of
+#     this logic) all fall back to "3 1 1" current + "2 1 1" issuer CA
+#     (Internet.nl's OTHER recommended pair) whenever no real previous
+#     EE generation exists yet, and automatically upgrade to full
+#     EE+EE (cleaning up the fallback TA record) the moment a real
+#     rotation happens. See cmd_setup's own comment for the exact
+#     add-before-delete ordering this requires.
 #   issuer: "3 1 1" (current leaf key) + "2 1 1" (current issuing
 #     intermediate CA) - Internet.nl's "Current + Issuer CA" scheme,
 #     this project's original choice. Protects against Let's
@@ -441,18 +467,42 @@ cmd_status()
         return 0
     }
 
-    okline "Rollover scheme: ${DANE_SCHEME} ($( [[ "$DANE_SCHEME" == "rollover" ]] && echo '"3 1 1" current + "3 1 1" previous' || echo '"3 1 1" current + "2 1 1" issuer CA' ))."
     if [[ "$DANE_SCHEME" == "rollover" ]]; then
-        check_tlsa_pair "3" "DANE-EE (3 1 1, current + previous)" "$(expected_tlsa_for)" "$(expected_tlsa_prev_for)"
-        local leftover_ta
-        leftover_ta="$(tlsa_lookup_all "$domain" "$label" "2")"
-        if [[ -n "$leftover_ta" ]]; then
-            failline "Found leftover DANE-TA (2 1 1) record(s) from the 'issuer' scheme while running 'rollover' - run --setup to clean up: ${leftover_ta}"
-            failed=$((failed + 1))
+        local new_ee prev_ee
+        new_ee="$(expected_tlsa_for)"
+        prev_ee="$(expected_tlsa_prev_for)"
+        if [[ -n "$prev_ee" && "$prev_ee" != "$new_ee" ]]; then
+            okline "Rollover scheme: rollover (\"3 1 1\" current + \"3 1 1\" previous - a real rotation has happened)."
+            check_tlsa_pair "3" "DANE-EE (3 1 1, current + previous)" "$new_ee" "$prev_ee"
+            local leftover_ta
+            leftover_ta="$(tlsa_lookup_all "$domain" "$label" "2")"
+            if [[ -n "$leftover_ta" ]]; then
+                failline "Found leftover DANE-TA (2 1 1) record(s) from the fallback/'issuer' scheme - run --setup to clean up: ${leftover_ta}"
+                failed=$((failed + 1))
+            fi
+        else
+            okline "Rollover scheme: rollover, but no previous EE generation exists yet - using the EE + issuer-CA fallback (\"3 1 1\" current + \"2 1 1\" issuer CA) until a real rotation happens."
+            check_tlsa_pair "3" "DANE-EE (3 1 1, current - no previous generation yet)" "$new_ee" ""
+            local ta_val
+            ta_val="$(expected_tlsa_ta_for)"
+            if [[ -n "$ta_val" ]]; then
+                check_tlsa_pair "2" "DANE-TA (2 1 1, issuer CA fallback)" "$ta_val" ""
+            else
+                failline "Could not compute a DANE-TA (2 1 1) fallback value from the certificate chain - only DANE-EE is published, no redundancy until a real rotation happens."
+                failed=$((failed + 1))
+            fi
         fi
     else
+        okline "Rollover scheme: issuer (\"3 1 1\" current + \"2 1 1\" issuer CA)."
         check_tlsa_pair "3" "DANE-EE (3 1 1)" "$(expected_tlsa_for)" ""
-        check_tlsa_pair "2" "DANE-TA (2 1 1, issuer CA)" "$(expected_tlsa_ta_for)" ""
+        local ta_val2
+        ta_val2="$(expected_tlsa_ta_for)"
+        if [[ -n "$ta_val2" ]]; then
+            check_tlsa_pair "2" "DANE-TA (2 1 1, issuer CA)" "$ta_val2" ""
+        else
+            failline "Could not compute a DANE-TA (2 1 1) value from the certificate chain."
+            failed=$((failed + 1))
+        fi
     fi
 
     if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then
@@ -677,11 +727,50 @@ cmd_setup()
 
     log "Rollover scheme: ${DANE_SCHEME}."
     if [[ "$DANE_SCHEME" == "rollover" ]]; then
-        publish_tlsa_pair "3" "DANE-EE (3 1 1, current + previous)" "$(expected_tlsa_for)" "$(expected_tlsa_prev_for)" || return 1
-        remove_usage_type "2" "DANE-TA (2 1 1)" || return 1
+        local new_ee prev_ee
+        new_ee="$(expected_tlsa_for)"
+        prev_ee="$(expected_tlsa_prev_for)"
+        if [[ -n "$prev_ee" && "$prev_ee" != "$new_ee" ]]; then
+            # A real previous EE generation exists (an actual key
+            # rotation has happened, not just a reuse_key renewal) -
+            # full EE+EE redundancy. ADD the new value before removing
+            # the fallback TA record below - never remove a matching
+            # record before its replacement is confirmed published.
+            publish_tlsa_pair "3" "DANE-EE (3 1 1, current + previous)" "$new_ee" "$prev_ee" || return 1
+            remove_usage_type "2" "DANE-TA (2 1 1, fallback - a real rotation happened, no longer needed)" || return 1
+        else
+            # No real previous EE generation yet - the common, ongoing
+            # case for as long as reuse_key keeps holding (see the
+            # file header's "DANE rollover scheme" section: the EE
+            # hash never changes across a plain renewal, so this can
+            # persist for a very long time, not just briefly after
+            # first setup). Publishing just ONE EE record here would
+            # leave zero redundancy, which is neither of Internet.nl's
+            # two recommended double-TLSA schemes. Fall back to EE +
+            # the issuing CA's own TA record (Internet.nl's OTHER
+            # recommended pair) until a real rotation happens - added
+            # 2026-11-19 after a review question about exactly this
+            # gap. Auto-upgrades to full EE+EE the moment a real
+            # rotation occurs (branch above), which also cleans up
+            # this fallback record automatically.
+            publish_tlsa_pair "3" "DANE-EE (3 1 1, current - no previous generation yet)" "$new_ee" "" || return 1
+            local ta_val
+            ta_val="$(expected_tlsa_ta_for)"
+            if [[ -n "$ta_val" ]]; then
+                publish_tlsa_pair "2" "DANE-TA (2 1 1, issuer CA fallback until a real rotation happens)" "$ta_val" "" || return 1
+            else
+                log "[WARN] Could not compute a DANE-TA (2 1 1) fallback value from the certificate chain - only the DANE-EE (3 1 1) record is published. No redundancy until a real key rotation happens."
+            fi
+        fi
     else
         publish_tlsa_pair "3" "DANE-EE (3 1 1)" "$(expected_tlsa_for)" "" || return 1
-        publish_tlsa_pair "2" "DANE-TA (2 1 1, issuer CA)" "$(expected_tlsa_ta_for)" "" || return 1
+        local ta_val2
+        ta_val2="$(expected_tlsa_ta_for)"
+        if [[ -n "$ta_val2" ]]; then
+            publish_tlsa_pair "2" "DANE-TA (2 1 1, issuer CA)" "$ta_val2" "" || return 1
+        else
+            log "[WARN] Could not compute a DANE-TA (2 1 1) value from the certificate chain - only the DANE-EE (3 1 1) record is published."
+        fi
     fi
 
     if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then
@@ -696,6 +785,19 @@ cmd_setup()
         bash -n "$DANE_TLSA_SCRIPT" || die "$DANE_TLSA_SCRIPT has a syntax error after editing - check it by hand."
         finalize_backup "$DANE_TLSA_SCRIPT"
         log "[ OK ] Added. Remember to also update the deployed copy if this script lives elsewhere too."
+    fi
+
+    # One-time migration cleanup: this hook used to be named
+    # 75-update-dane-tlsa (sorting AFTER 70-sync-ssl-key's nginx reload
+    # - backwards, see $DEPLOY_HOOK's own comment above for why it was
+    # renamed to 60-... 2026-11-19). Remove that stale copy so it does
+    # not keep running twice (harmless but pointless) or, worse, stay
+    # around as the only copy if a future edit here is ever missed.
+    local old_hook="/etc/letsencrypt/renewal-hooks/deploy/75-update-dane-tlsa"
+    if [[ -f "$old_hook" ]]; then
+        log "Removing the old, incorrectly-ordered deploy-hook at ${old_hook}..."
+        rm -f "$old_hook"
+        log "[ OK ] Removed. ${DEPLOY_HOOK} (installed below) replaces it."
     fi
 
     if [[ ! -x "$DEPLOY_HOOK" ]]; then
@@ -729,13 +831,58 @@ cmd_report()
     want_tlsa="$(expected_tlsa_for)"
     [[ -n "$want_tlsa" ]] || die "Could not compute the expected TLSA value - does /etc/letsencrypt/live/${CERT_NAME}/cert.pem exist yet?"
 
-    echo "DANE/TLSA record for ${target}"
+    echo "DANE/TLSA record(s) for ${target}"
     echo "================================"
     echo
     echo "  Name:  _25._tcp.${target}"
     echo "  Type:  TLSA"
     echo "  Value: ${want_tlsa}"
     echo
+
+    # This mirrors cmd_setup/cmd_status's own fallback logic exactly -
+    # always show a SECOND record too, matching whichever of
+    # Internet.nl's two recommended pairs actually applies right now,
+    # for the no-TransIP-credentials manual-publish path. Added
+    # 2026-11-19 - before this, --report never showed the second
+    # record at all, even for DANE_SCHEME=issuer.
+    if [[ "$DANE_SCHEME" == "rollover" ]]; then
+        local prev_ee
+        prev_ee="$(expected_tlsa_prev_for)"
+        if [[ -n "$prev_ee" && "$prev_ee" != "$want_tlsa" ]]; then
+            echo "  Name:  _25._tcp.${target}  (previous generation - keep this one published too)"
+            echo "  Type:  TLSA"
+            echo "  Value: ${prev_ee}"
+            echo
+        else
+            local ta_val
+            ta_val="$(expected_tlsa_ta_for)"
+            if [[ -n "$ta_val" ]]; then
+                echo "  No previous certificate generation exists yet, so the record above alone"
+                echo "  would leave zero redundancy. Also publish the issuer-CA fallback record"
+                echo "  below until the first real key rotation happens:"
+                echo
+                echo "  Name:  _25._tcp.${target}"
+                echo "  Type:  TLSA"
+                echo "  Value: ${ta_val}"
+                echo
+            else
+                echo "  No previous certificate generation exists yet, and the issuer-CA fallback"
+                echo "  value could not be computed from the certificate chain - only the record"
+                echo "  above is published, with no redundancy."
+                echo
+            fi
+        fi
+    else
+        local ta_val2
+        ta_val2="$(expected_tlsa_ta_for)"
+        if [[ -n "$ta_val2" ]]; then
+            echo "  Name:  _25._tcp.${target}"
+            echo "  Type:  TLSA"
+            echo "  Value: ${ta_val2}"
+            echo
+        fi
+    fi
+
     echo "Publish this exact record at your DNS registrar (TTL: your registrar's"
     echo "own short-lived-record default is fine, e.g. 300-3600s)."
     echo "Re-run manage-dane.sh -domain ${domain} --status afterward to confirm it matches."

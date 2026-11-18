@@ -155,7 +155,7 @@ die() { echo "[update-dane-tlsa] ERROR: $*" >&2; exit 1; }
 # REAL BUG FOUND 2026-11-15: this script hardcoded account1.ini/.key
 # for EVERY domain in DANE_DOMAINS, no matter which TransIP account
 # actually owns it - worked only because exactly one account existed.
-# Flagged live by the operator right after the same hardcoding was fixed in
+# Flagged live right after the same hardcoding was fixed in
 # manage-dane.sh, which this script was missed by at the time since it
 # runs standalone, not through functions/00-common.sh.
 transip_account_for()
@@ -384,8 +384,24 @@ for entry in "${DANE_DOMAINS[@]}"; do
     fi
 
     if [[ "$DANE_SCHEME" == "rollover" ]]; then
-        publish_tlsa_pair "$DOMAIN" "$RECORD_NAME" "$TRANSIP_USER" "$KEY_FILE" "3" "$NEW_RRDATA_EE" "$PREV_RRDATA_EE" || FAILED=1
-        remove_usage_type "$DOMAIN" "$RECORD_NAME" "$TRANSIP_USER" "$KEY_FILE" "2" || FAILED=1
+        if [[ -n "$PREV_RRDATA_EE" && "$PREV_RRDATA_EE" != "$NEW_RRDATA_EE" ]]; then
+            # A real previous EE generation exists (an actual key
+            # rotation happened) - full EE+EE. ADD the new value
+            # before removing the fallback TA record - never remove a
+            # matching record before its replacement is confirmed
+            # published. See manage-dane.sh's own cmd_setup comment
+            # for the full reasoning (mirrored here 2026-11-19).
+            publish_tlsa_pair "$DOMAIN" "$RECORD_NAME" "$TRANSIP_USER" "$KEY_FILE" "3" "$NEW_RRDATA_EE" "$PREV_RRDATA_EE" || FAILED=1
+            remove_usage_type "$DOMAIN" "$RECORD_NAME" "$TRANSIP_USER" "$KEY_FILE" "2" || FAILED=1
+        else
+            # No real previous EE generation yet - fall back to EE +
+            # issuer-CA (Internet.nl's other recommended pair) so
+            # there is always real redundancy, not a bare single
+            # record. Auto-upgrades to full EE+EE above the moment a
+            # real rotation happens.
+            publish_tlsa_pair "$DOMAIN" "$RECORD_NAME" "$TRANSIP_USER" "$KEY_FILE" "3" "$NEW_RRDATA_EE" "" || FAILED=1
+            publish_tlsa_pair "$DOMAIN" "$RECORD_NAME" "$TRANSIP_USER" "$KEY_FILE" "2" "$NEW_RRDATA_TA" "" || FAILED=1
+        fi
     else
         publish_tlsa_pair "$DOMAIN" "$RECORD_NAME" "$TRANSIP_USER" "$KEY_FILE" "3" "$NEW_RRDATA_EE" "" || FAILED=1
         publish_tlsa_pair "$DOMAIN" "$RECORD_NAME" "$TRANSIP_USER" "$KEY_FILE" "2" "$NEW_RRDATA_TA" "" || FAILED=1

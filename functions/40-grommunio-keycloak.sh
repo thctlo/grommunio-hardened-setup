@@ -135,15 +135,15 @@ fi
 # shared/grommunio/site-fqdn at all - both grommunio-auth.config and
 # grommunio-keycloak.config reference it (confirmed by reading the real
 # postinst/.config scripts, not guessed). Without it, Keycloak ended up
-# issuing tokens as this SERVER's own system hostname (mx1.example1.eu,
-# this server's mail-exchange/PTR identity - set in step 10 for Postfix/
-# DANE, never meant for anything web-facing) instead of the public FQDN
-# users actually connect through - confirmed live via the discovery
-# endpoint's own "issuer" field. Keycloak must use the public FQDN
-# ($FQDN, e.g. mail.<domain>) for its issuer/redirect URIs - mx1 is a
-# Postfix/certificate-only identity, never a Keycloak one. Preseeded
-# under both owner names, same pattern as the admin-password preseed
-# below.
+# issuing tokens as this SERVER's own system hostname (its dedicated
+# mx-hostname, this server's mail-exchange/PTR identity - set in step
+# 10 for Postfix/DANE, never meant for anything web-facing) instead of
+# the public FQDN users actually connect through - confirmed live via
+# the discovery endpoint's own "issuer" field. Keycloak must use the
+# public FQDN ($FQDN, e.g. mail.<domain>) for its issuer/redirect
+# URIs - the mx-hostname is a Postfix/certificate-only identity, never
+# a Keycloak one. Preseeded under both owner names, same pattern as
+# the admin-password preseed below.
 debconf-set-selections <<< "grommunio-auth shared/grommunio/site-fqdn string ${FQDN}"
 debconf-set-selections <<< "grommunio-keycloak shared/grommunio/site-fqdn string ${FQDN}"
 log "Preseeded shared/grommunio/site-fqdn = ${FQDN} for grommunio-auth and grommunio-keycloak."
@@ -250,7 +250,7 @@ check_file /etc/gromox/bearer_pubkey root:root 644
 # clients`). Visiting via any OTHER hostname nginx also answers for
 # (e.g. a migrated domain's own mail.* name, cut over to this server)
 # then fails with "Invalid parameter: redirect_uri" - confirmed live
-# 2026-11-17 for example2.com. Per the grommunio setup guide's own
+# 2026-11-17 for a migrated domain. Per the grommunio setup guide's own
 # troubleshooting table: "Use one FQDN everywhere; set redirect-url in
 # keycloak.json if nginx serves several host names." Pinned to this
 # server's own system hostname - the same value already used as the

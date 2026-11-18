@@ -98,9 +98,9 @@ TD_KEY_FILE="$(transip_key_for "$TARGET_DOMAIN")"
 
 # One read of the whole zone, reused by every upsert_record call below -
 # never re-queried per record, and never assumed empty. A domain being
-# cut over from an old server (like example2.com) already has every
-# one of these records, just pointing elsewhere - this is NOT only a
-# "brand-new domain, nothing exists" tool.
+# cut over from an old server already has every one of these records,
+# just pointing elsewhere - this is NOT only a "brand-new domain,
+# nothing exists" tool.
 EXISTING="$(transip-dns --username "$TD_USER" --key-file "$TD_KEY_FILE" list "$TARGET_DOMAIN" 2>/dev/null)"
 
 # upsert_record <name> <type> <content>: adds a fresh record if none
@@ -111,7 +111,7 @@ EXISTING="$(transip-dns --username "$TD_USER" --key-file "$TD_KEY_FILE" list "$T
 # content already matches (idempotent, safe to re-run).
 #
 # REAL BUG FOUND 2026-11-16: a blind `add` with a fixed TTL of 86400
-# failed outright against example2.com's existing @ A record (TTL
+# failed outright against a real domain's existing @ A record (TTL
 # 300, pointing at the OLD server) - "the expire of all records in an
 # rrset must be all the same". Same root cause already seen in
 # update-dane-tlsa.sh. This is the fix: check first, update (same TTL)
@@ -143,4 +143,4 @@ upsert_record() {
 upsert_record "autodiscover" CNAME "mail.${TARGET_DOMAIN}."
 
 log "[ OK ] Done. Re-run check-cert-readiness.sh -domain ${TARGET_DOMAIN} once this has propagated to confirm."
-log "Note: this script only touches @/mail/autodiscover (A/AAAA/CNAME). It does NOT touch MX, SPF/TXT, or www - those need their own separate, deliberate review (e.g. example2.com's existing SPF record still explicitly authorizes the OLD server's IP)."
+log "Note: this script only touches @/mail/autodiscover (A/AAAA/CNAME). It does NOT touch MX, SPF/TXT, or www - those need their own separate, deliberate review (a cut-over domain's existing SPF record, for example, can still explicitly authorize the OLD server's IP)."

@@ -197,16 +197,17 @@ log "  grommunio-admin user modify <user> --privFiles true"
 # REAL BUG FOUND 2026-11-14: grommunio-files' own postinst does not
 # reliably add the real public FQDN (the one end users actually type into
 # a browser) to Nextcloud's trusted_domains. Found live with a truncated,
-# garbage entry ("mail." instead of "mail.example1.eu") sitting alongside
-# a correct but DIFFERENT entry (mx1.example1.eu - this server's own
+# garbage entry ("mail." instead of the real public FQDN) sitting
+# alongside a correct but DIFFERENT entry (this server's own
 # mail-exchange/PTR hostname, not the public web FQDN). Nextcloud rejects
 # EVERY request whose Host header is not in this list with a flat 400,
 # before auth or routing even happen - this is what made the WebDAV
 # verification below fail with no useful nginx/ModSecurity-level trace at
 # all (confirmed directly: the same request succeeds with Host: localhost
-# or Host: mx1.example1.eu, and fails identically for every method/path/
-# auth combination otherwise - never a WebDAV or WAF issue in the first
-# place). Fixed the supported way (occ, not editing config.php by hand).
+# or Host: <the mail-exchange hostname>, and fails identically for every
+# method/path/auth combination otherwise - never a WebDAV or WAF issue in
+# the first place). Fixed the supported way (occ, not editing config.php
+# by hand).
 local OCC="/usr/share/grommunio-files/occ"
 local OCC_USER="grofiles"
 if [[ -x "$OCC" ]]; then
@@ -399,7 +400,7 @@ unset TEST_PASSWORD
 #
 # Fixed upstream since: confirmed live 2026-11-14 on grommunio-files
 # 34.0.4-1 - the package's OWN shipped unit now has OnUnitActiveSec=5min
-# natively (flagged by the operator: "mogelijk is deze niet meer nodig?" -
+# natively (flagged during review: is this override still needed? -
 # checked, and yes). Checking the PACKAGE's own file directly (not
 # `systemctl cat`, which would show OUR drop-in's directive too and
 # mask whether the package itself still needs it) rather than assuming

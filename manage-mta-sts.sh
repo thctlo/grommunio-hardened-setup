@@ -12,15 +12,16 @@
 # their aggregate TLS-failure reports. Added 2026-11-18: an external
 # scanner found it missing, and a live audit then showed it had only
 # ever been set by hand for 4 of 13 active domains (one TransIP
-# account) - never for the other 9 (the second TransIP account) or
-# example3.nl (no TransIP account configured for it - degrades the same
-# way as any other missing-credentials domain below). Entirely
+# account) - never for the other 9 (the second TransIP account) or a
+# 13th domain with no TransIP account configured for it at all
+# (degrades the same way as any other missing-credentials domain
+# below). Entirely
 # independent of this domain's own mta-sts.<domain> web hosting - pure
 # DNS, no wanted_domains() gate, applies to every active domain. One
 # centralized rua address for all domains (not per-domain) -
-# postmaster@<first active domain> - confirmed by the operator as an existing
-# alias onto the admin shared mailbox he actively reads, matching
-# exactly what the 4 pre-existing live records already used.
+# postmaster@<first active domain> - confirmed as an existing alias
+# onto the admin shared mailbox, actively read, matching exactly what
+# the 4 pre-existing live records already used.
 #
 # MTA-STS needs three things per domain:
 #   1. A DNS TXT record at _mta-sts.<domain> ("v=STSv1; id=...") - checked
@@ -172,7 +173,7 @@ POLICY_ROOT="/var/www/mta-sts"
 NGINX_CONF="/etc/nginx/conf.d/mta-sts.conf"
 DEFAULT_MAX_AGE=604800   # 1 week
 # TTL used only when PUBLISHING A NEW _mta-sts TXT record (--setup) - 5
-# minutes, the operator's call 2026-11-15 (no established convention existed
+# minutes, the operator's own choice (no established convention existed
 # for this record before now). Updating an EXISTING record instead
 # uses its own live TTL (transip_live_ttl_for, functions/00-common.sh)
 # - transip-dns update requires name/type/TTL to match exactly, it

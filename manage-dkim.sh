@@ -95,7 +95,7 @@ RECORDS="/root/cfg-server/dkim-dns-records.txt"
 # both TXT and CNAME, matching this project's own documented convention
 # for DKIM/DMARC (see docs/dns-records-reference.md: "Short TTLs (5
 # minutes) on the DKIM and DMARC records make key rotation... take
-# effect quickly"), decided by the operator 2026-11-15. Updating an EXISTING
+# effect quickly"), the operator's own choice. Updating an EXISTING
 # record instead uses its own live TTL (transip_live_ttl_for,
 # functions/00-common.sh) - transip-dns update requires name/type/TTL
 # to match exactly, it cannot change the TTL itself.

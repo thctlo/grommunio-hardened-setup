@@ -216,8 +216,7 @@ confirm_all_domains() {
 # instead of three scripts reimplementing the same filter separately.
 # Added 2026-11-15 alongside --report/--mail for manage-dane.sh/
 # manage-dkim.sh/manage-mta-sts.sh - the three tools that can actually
-# write DNS records, per the operator's own request to add these consistently
-# wherever that's true.
+# write DNS records, added consistently wherever that's true.
 # ============================================================
 BRIEF="${BRIEF:-0}"
 
@@ -424,8 +423,8 @@ dane_label_for()
 # certbot names the live/ directory after whatever --cert-name it was
 # issued with, which on a server with a dedicated mx-hostname is
 # Postfix's own identity (NEW_MX_FQDN), not the web hostname (NEW_FQDN)
-# - confirmed live, the real directory was mx1.example1.eu, not
-# mail.example1.eu. Checks postconf's live myhostname first (the
+# - confirmed live, the real directory was the mx-hostname, not
+# the web hostname. Checks postconf's live myhostname first (the
 # actual source of truth for what the cert SHOULD be named after), then
 # NEW_MX_FQDN/NEW_FQDN as saved-config fallbacks, then whatever single
 # certificate actually exists on disk, so every caller discovers the

@@ -10,7 +10,7 @@
 #      grommunio key. Only the apt source and the key are installed;
 #      the community setup script and the licence file are not used.
 #      This is the right choice for anyone following this project's
-#      own install docs on a server that is not the operator's own build
+#      own install docs on a server that is not the original build
 #      host - option 2's local file repo only exists there. Choosing
 #      this explicitly disables any existing personal-repo overlay
 #      (moved aside, not deleted) - option 2 is what re-enables it.
