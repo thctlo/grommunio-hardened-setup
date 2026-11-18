@@ -116,12 +116,29 @@
 #                                    TLSRPT TXT record for every active
 #                                    domain (not just ones with mta-sts
 #                                    web hosting here).
+#                                    Put -domain <name> BEFORE --setup to
+#                                    scope this to just that one domain -
+#                                    -domain must come first, a later flag
+#                                    only sets the action, it never clears
+#                                    which domain was already given.
+#                                    Omitting -domain always means every
+#                                    domain, and now always asks for an
+#                                    explicit "yes" first
+#                                    (confirm_all_domains,
+#                                    functions/00-common.sh) - added
+#                                    2026-11-19 after a real incident in
+#                                    manage-dkim.sh's own --setup where
+#                                    "-domain <name> --setup" was typed
+#                                    expecting one domain and every domain
+#                                    got touched instead.
 #   manage-mta-sts.sh --report       Not a check - prints every served
 #                                    domain's own _mta-sts TXT record plus
 #                                    every active domain's _smtp._tls
 #                                    TLSRPT TXT record, copy-paste-ready
 #                                    for a registrar that needs them added
-#                                    by hand.
+#                                    by hand. -domain <name> before
+#                                    --status/--report also scopes those
+#                                    two to just that one domain.
 #   --brief                          Modifier for --status/--report/
 #                                    --setup: only [FAIL]/[WARN] lines
 #                                    and a one-line summary, no [ OK ]
@@ -171,7 +188,7 @@ TLSRPT_DEFAULT_TTL=300
 
 show_help()
 {
-    sed -n '3,142p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,159p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 resolves_here()
@@ -285,14 +302,27 @@ _mta_sts_rebuild_nginx_conf()
 cmd_generate()
 {
     require_cmd resolvectl
+    local only="${1:-}"
 
     local -a domains=()
     while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
     [[ "${#domains[@]}" -gt 0 ]] || die "No mta-sts.<domain> hostname resolves to this server - nothing to configure."
 
+    # write_domains may be scoped to just $only (see header: -domain
+    # <name> before --all/--setup) - domains itself never is, since
+    # _mta_sts_rebuild_nginx_conf below must always see every domain or
+    # it would drop every OTHER domain's server block from nginx.
+    local -a write_domains=("${domains[@]}")
+    if [[ -n "$only" ]]; then
+        local found=0 d
+        for d in "${domains[@]}"; do [[ "$d" == "$only" ]] && { found=1; break; }; done
+        [[ "$found" -eq 1 ]] || die "mta-sts.$only does not resolve to this server."
+        write_domains=("$only")
+    fi
+
     local _changed=0 d policy_file mx_host
 
-    for d in "${domains[@]}"; do
+    for d in "${write_domains[@]}"; do
         install -d -m 0755 "${POLICY_ROOT}/${d}/.well-known"
         policy_file="${POLICY_ROOT}/${d}/.well-known/mta-sts.txt"
         if [[ -f "$policy_file" ]]; then
@@ -327,14 +357,29 @@ cmd_generate()
 cmd_reconfigure()
 {
     require_cmd resolvectl
+    local only="${1:-}"
 
     local -a domains=()
     while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
     [[ "${#domains[@]}" -gt 0 ]] || die "No mta-sts.<domain> hostname resolves to this server - nothing to configure."
 
+    # write_domains may be scoped to just $only - domains itself never
+    # is, same reasoning as cmd_generate() above (nginx conf rebuild
+    # must always see every domain).
+    local -a write_domains=("${domains[@]}")
+    if [[ -n "$only" ]]; then
+        local found=0 d
+        for d in "${domains[@]}"; do [[ "$d" == "$only" ]] && { found=1; break; }; done
+        if [[ "$found" -eq 0 ]]; then
+            log "[SKIP] ${only}: mta-sts.${only} does not resolve here - nothing to reconfigure for it."
+            return 0
+        fi
+        write_domains=("$only")
+    fi
+
     local _changed=0 d policy_file expected_mx actual_mx mode max_age
 
-    for d in "${domains[@]}"; do
+    for d in "${write_domains[@]}"; do
         install -d -m 0755 "${POLICY_ROOT}/${d}/.well-known"
         policy_file="${POLICY_ROOT}/${d}/.well-known/mta-sts.txt"
         expected_mx="$(policy_mx_for "$d")"
@@ -427,6 +472,12 @@ cmd_status()
 
     local -a all_domains=()
     while read -r d; do [[ -n "$d" ]] && all_domains+=("$d"); done < <(all_active_domains)
+    if [[ -n "$TARGET_DOMAIN" ]]; then
+        local found=0 d
+        for d in "${all_domains[@]}"; do [[ "$d" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
+        [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' is not an active grommunio domain (grommunio-admin domain list)."
+        all_domains=("$TARGET_DOMAIN")
+    fi
 
     local d failed=0 txt policy_url served expected_mx actual_mx
     local domain_out domain_failed skipped tlsrpt_txt tlsrpt_expected
@@ -640,12 +691,42 @@ cmd_setup()
 {
     require_cmd resolvectl
 
+    # Scope to just TARGET_DOMAIN when given (-domain <name> --setup) -
+    # added 2026-11-19 after a real incident in manage-dkim.sh's own
+    # --setup where this exact flag combination was typed expecting one
+    # domain and every domain got touched instead, because neither
+    # script's cmd_setup looked at TARGET_DOMAIN at all. Omitting
+    # -domain always means every active domain - and now always asks
+    # first (confirm_all_domains, functions/00-common.sh), listing the
+    # exact domains that are about to get real DNS writes.
+    local -a all_domains=()
+    while read -r d; do [[ -n "$d" ]] && all_domains+=("$d"); done < <(all_active_domains)
+    [[ "${#all_domains[@]}" -gt 0 ]] || die "No active domains found (grommunio-admin domain list)."
+
+    if [[ -n "$TARGET_DOMAIN" ]]; then
+        local found=0 d
+        for d in "${all_domains[@]}"; do [[ "$d" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
+        [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' is not an active grommunio domain (grommunio-admin domain list)."
+        all_domains=("$TARGET_DOMAIN")
+    else
+        confirm_all_domains "publish/update _mta-sts and _smtp._tls (TLSRPT) DNS records" "${all_domains[@]}"
+    fi
+
     [[ "$BRIEF" -eq 1 ]] || log "Running --reconfigure first, so the local policy/mx side is correct..."
-    cmd_reconfigure
+    cmd_reconfigure "$TARGET_DOMAIN"
 
     local -a domains=()
     while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
-    [[ "${#domains[@]}" -gt 0 ]] || die "No mta-sts.<domain> hostname resolves to this server - nothing to publish."
+    if [[ -n "$TARGET_DOMAIN" ]]; then
+        if printf '%s\n' "${domains[@]}" | grep -qxF "$TARGET_DOMAIN"; then
+            domains=("$TARGET_DOMAIN")
+        else
+            log "[SKIP] ${TARGET_DOMAIN}: mta-sts.${TARGET_DOMAIN} does not resolve here - no _mta-sts TXT to publish for it, only _smtp._tls (TLSRPT) below."
+            domains=()
+        fi
+    elif [[ "${#domains[@]}" -eq 0 ]]; then
+        log "[SKIP] No mta-sts.<domain> hostname resolves to this server - no _mta-sts TXT to publish for any domain, only _smtp._tls (TLSRPT) below."
+    fi
 
     local d failed=0 domain_out domain_failed
     for d in "${domains[@]}"; do
@@ -657,9 +738,6 @@ cmd_setup()
             printf '%s\n' "$domain_out"
         fi
     done
-
-    local -a all_domains=()
-    while read -r d; do [[ -n "$d" ]] && all_domains+=("$d"); done < <(all_active_domains)
 
     local tlsrpt_failed=0
     for d in "${all_domains[@]}"; do
@@ -695,6 +773,13 @@ cmd_report()
 
     local -a domains=()
     while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
+    if [[ -n "$TARGET_DOMAIN" ]]; then
+        if printf '%s\n' "${domains[@]}" | grep -qxF "$TARGET_DOMAIN"; then
+            domains=("$TARGET_DOMAIN")
+        else
+            domains=()
+        fi
+    fi
 
     local d expected
     if [[ "${#domains[@]}" -eq 0 ]]; then
@@ -715,6 +800,12 @@ cmd_report()
     local -a all_domains=()
     while read -r d; do [[ -n "$d" ]] && all_domains+=("$d"); done < <(all_active_domains)
     [[ "${#all_domains[@]}" -gt 0 ]] || die "No active domains found (grommunio-admin domain list) - nothing to report."
+    if [[ -n "$TARGET_DOMAIN" ]]; then
+        local found=0 d
+        for d in "${all_domains[@]}"; do [[ "$d" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
+        [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' is not an active grommunio domain (grommunio-admin domain list)."
+        all_domains=("$TARGET_DOMAIN")
+    fi
 
     expected="$(tlsrpt_expected_txt_for)"
     for d in "${all_domains[@]}"; do
@@ -789,13 +880,13 @@ run_action()
             for a in "${ALL_DOMAINS[@]}"; do [[ "$a" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
             [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' is not an active grommunio domain (grommunio-admin domain list)."
             resolves_here "mta-sts.$TARGET_DOMAIN" || die "mta-sts.$TARGET_DOMAIN does not resolve to this server."
-            cmd_generate
+            cmd_generate "$TARGET_DOMAIN"
             ;;
         status)
             cmd_status
             ;;
         reconfigure)
-            cmd_reconfigure
+            cmd_reconfigure "$TARGET_DOMAIN"
             ;;
         enforce)
             [[ -n "$TARGET_DOMAIN" ]] || die "--enforce requires -domain <name>."

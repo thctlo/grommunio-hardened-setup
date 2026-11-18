@@ -173,6 +173,41 @@ require_cmd() {
 }
 
 # ============================================================
+# confirm_all_domains <what> <domain...>: mandatory interactive safety
+# gate for any --setup (or other state-changing) action about to touch
+# EVERY active domain at once because the operator did NOT scope it
+# with -domain <name>. Added 2026-11-19 after a real incident where
+# manage-dkim.sh's --setup silently republished DKIM records for every
+# domain when the operator typed "-domain <name> --setup" expecting it
+# to be scoped - it wasn't (cmd_setup never looked at TARGET_DOMAIN at
+# all). Same risk existed in manage-mta-sts.sh's --setup. Every
+# --setup in this project must now either run against one domain
+# (never prompts) or run against all of them (always prompts here
+# first, printing the exact list).
+#
+# Requires typing the literal word "yes" (not bare Enter/"y") - a
+# throwaway keypress should not be enough to reconfigure DNS for every
+# domain. Refuses outright (never silently proceeds, never hangs) when
+# there is no terminal to confirm on - e.g. under --mail, which
+# captures this whole run's stdout/stderr via $(...) for the e-mail
+# body, so a read prompt there would have no one to answer it.
+# ============================================================
+confirm_all_domains() {
+    local what="$1"; shift
+    local -a doms=("$@")
+    echo
+    echo "About to ${what} for ALL ${#doms[@]} active domain(s):"
+    printf '    %s\n' "${doms[@]}"
+    echo
+    if [[ ! -t 0 ]]; then
+        die "Refusing to proceed without a terminal to confirm on. Re-run with -domain <name> to scope this to one domain, or run interactively (not via --mail) to confirm all ${#doms[@]}."
+    fi
+    local reply=""
+    read -r -p "Continue for ALL ${#doms[@]} domains? Type 'yes' to confirm: " reply
+    [[ "$reply" == "yes" ]] || die "Aborted - nothing was changed. Re-run with -domain <name> to scope this to one domain."
+}
+
+# ============================================================
 # --brief support for manage-*.sh's own --status/--report/--setup
 # output. A caller sets BRIEF=1 before running its checks; okline()
 # then silently drops [ OK ] lines while failline()/warnline() always

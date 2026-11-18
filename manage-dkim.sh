@@ -26,10 +26,23 @@
 #                                  whatever it finds missing or wrong, via the
 #                                  TransIP API (TransIP only - see below) -
 #                                  for every domain that already has a local key.
+#                                  Put -domain <name> BEFORE --setup to scope this
+#                                  to just that one domain instead - -domain must
+#                                  come first, a later flag only sets the action,
+#                                  it never clears which domain was already given.
+#                                  Omitting -domain always means every domain, and
+#                                  now always asks for an explicit "yes" first
+#                                  (confirm_all_domains, functions/00-common.sh) -
+#                                  added 2026-11-19 after a real incident where
+#                                  "-domain <name> --setup" was typed expecting one
+#                                  domain and every signed domain got republished
+#                                  instead, because this check did not exist yet.
 #   manage-dkim.sh --report        Not a check - prints every signed domain's
 #                                  own DKIM records (dkim-ed/dkim-rsa TXT,
 #                                  dkim CNAME), copy-paste-ready for a
 #                                  registrar that needs them added by hand.
+#                                  -domain <name> before --status/--report also
+#                                  scopes those two to just that one domain.
 #   --brief                        Modifier for --status/--report/--setup:
 #                                  only [FAIL]/[WARN] lines and a one-line
 #                                  summary, no [ OK ] lines.
@@ -90,7 +103,7 @@ DKIM_DEFAULT_TTL=300
 
 show_help()
 {
-    sed -n '3,66p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,79p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # make_dkim_key <domain> <selector> <type> [bits]: creates one key, keeps an existing one
@@ -399,6 +412,21 @@ cmd_setup()
         die "No domains have a local DKIM key yet (run --all or -domain <name> first)."
     fi
 
+    # Scope to just TARGET_DOMAIN when given (-domain <name> --setup) -
+    # added 2026-11-19 after a real incident where this was typed
+    # expecting one domain and every signed domain got republished
+    # instead, because this loop never looked at TARGET_DOMAIN at all.
+    # Omitting -domain still means "all" - but now that always asks
+    # first (confirm_all_domains, functions/00-common.sh).
+    if [[ -n "$TARGET_DOMAIN" ]]; then
+        local found=0 d
+        for d in "${domains[@]}"; do [[ "$d" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
+        [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' has no local DKIM key yet (run -domain ${TARGET_DOMAIN} first, without --setup)."
+        domains=("$TARGET_DOMAIN")
+    else
+        confirm_all_domains "publish/update DKIM DNS records" "${domains[@]}"
+    fi
+
     local d failed=0
     for d in "${domains[@]}"; do
         echo
@@ -426,6 +454,13 @@ cmd_validate()
 
     if [[ "${#domains[@]}" -eq 0 ]]; then
         die "No domains have a local DKIM key yet (run --all or -domain <name> first)."
+    fi
+
+    if [[ -n "$TARGET_DOMAIN" ]]; then
+        local found=0 d
+        for d in "${domains[@]}"; do [[ "$d" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
+        [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' has no local DKIM key yet (run -domain ${TARGET_DOMAIN} first)."
+        domains=("$TARGET_DOMAIN")
     fi
 
     local d failed=0 checked=0 domain_out domain_failed
@@ -468,6 +503,13 @@ cmd_report()
     local -a domains=()
     while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(signed_domains)
     [[ "${#domains[@]}" -gt 0 ]] || die "No domains have a local DKIM key yet (run --all or -domain <name> first)."
+
+    if [[ -n "$TARGET_DOMAIN" ]]; then
+        local found=0 d
+        for d in "${domains[@]}"; do [[ "$d" == "$TARGET_DOMAIN" ]] && { found=1; break; }; done
+        [[ "$found" -eq 1 ]] || die "Domain '$TARGET_DOMAIN' has no local DKIM key yet (run -domain ${TARGET_DOMAIN} first)."
+        domains=("$TARGET_DOMAIN")
+    fi
 
     local d sel txt_file value
     for d in "${domains[@]}"; do
