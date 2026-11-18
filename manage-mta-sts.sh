@@ -7,6 +7,21 @@
 # manage-dkim.sh/manage-certs.sh in spirit: re-run by hand any time a
 # domain is added or removed.
 #
+# Also manages TLSRPT (RFC 8460) - a separate but always-paired DNS TXT
+# record at _smtp._tls.<domain>, telling remote senders where to mail
+# their aggregate TLS-failure reports. Added 2026-11-18: an external
+# scanner found it missing, and a live audit then showed it had only
+# ever been set by hand for 4 of 13 active domains (one TransIP
+# account) - never for the other 9 (the second TransIP account) or
+# example3.nl (no TransIP account configured for it - degrades the same
+# way as any other missing-credentials domain below). Entirely
+# independent of this domain's own mta-sts.<domain> web hosting - pure
+# DNS, no wanted_domains() gate, applies to every active domain. One
+# centralized rua address for all domains (not per-domain) -
+# postmaster@<first active domain> - confirmed by the operator as an existing
+# alias onto the admin shared mailbox he actively reads, matching
+# exactly what the 4 pre-existing live records already used.
+#
 # MTA-STS needs three things per domain:
 #   1. A DNS TXT record at _mta-sts.<domain> ("v=STSv1; id=...") - checked
 #      read-only by --status/--validate; --setup can also PUBLISH/UPDATE
@@ -59,13 +74,13 @@
 #   manage-mta-sts.sh -domain <name> Same, but fail loudly if this one
 #                                    domain's mta-sts.<domain> hostname
 #                                    does not resolve here.
-#   manage-mta-sts.sh --status       Check DNS (_mta-sts TXT), the
-#                                    live-served policy file, and that
-#                                    its "mx:" value matches this domain's
-#                                    real MX record, for every active
-#                                    domain; report what is missing or
-#                                    wrong. Read-only, changes nothing.
-#                                    (--validate is a kept alias.)
+#   manage-mta-sts.sh --status       Check DNS (_mta-sts TXT and _smtp._tls
+#                                    TLSRPT TXT), the live-served policy
+#                                    file, and that its "mx:" value matches
+#                                    this domain's real MX record, for
+#                                    every active domain; report what is
+#                                    missing or wrong. Read-only, changes
+#                                    nothing. (--validate is a kept alias.)
 #   manage-mta-sts.sh --reconfigure  Like --all, but also FIXES an
 #                                    existing policy file's "mx:" line if
 #                                    it does not match this domain's real
@@ -96,11 +111,17 @@
 #                                    served policy content changed since
 #                                    the last publish, matching RFC 8461's
 #                                    own requirement that id change
-#                                    whenever the policy does.
+#                                    whenever the policy does. Also
+#                                    PUBLISHES/UPDATES the _smtp._tls
+#                                    TLSRPT TXT record for every active
+#                                    domain (not just ones with mta-sts
+#                                    web hosting here).
 #   manage-mta-sts.sh --report       Not a check - prints every served
-#                                    domain's own _mta-sts TXT record,
-#                                    copy-paste-ready for a registrar
-#                                    that needs it added by hand.
+#                                    domain's own _mta-sts TXT record plus
+#                                    every active domain's _smtp._tls
+#                                    TLSRPT TXT record, copy-paste-ready
+#                                    for a registrar that needs them added
+#                                    by hand.
 #   --brief                          Modifier for --status/--report/
 #                                    --setup: only [FAIL]/[WARN] lines
 #                                    and a one-line summary, no [ OK ]
@@ -141,9 +162,16 @@ DEFAULT_MAX_AGE=604800   # 1 week
 # cannot change the TTL itself.
 MTA_STS_DEFAULT_TTL=300
 
+# TTL used only when PUBLISHING A NEW _smtp._tls TLSRPT TXT record
+# (--setup) - matches the 4 pre-existing live TLSRPT records' own TTL
+# (confirmed 2026-11-18 via transip-dns list before this was scripted).
+# Updating an EXISTING record uses its own live TTL, same reasoning as
+# MTA_STS_DEFAULT_TTL above.
+TLSRPT_DEFAULT_TTL=300
+
 show_help()
 {
-    sed -n '3,121p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,142p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 resolves_here()
@@ -401,7 +429,7 @@ cmd_status()
     while read -r d; do [[ -n "$d" ]] && all_domains+=("$d"); done < <(all_active_domains)
 
     local d failed=0 txt policy_url served expected_mx actual_mx
-    local domain_out domain_failed skipped
+    local domain_out domain_failed skipped tlsrpt_txt tlsrpt_expected
     for d in "${all_domains[@]}"; do
         domain_failed=0
         skipped=0
@@ -411,6 +439,18 @@ cmd_status()
                 okline "_mta-sts.$d TXT record found: $txt"
             else
                 failline "_mta-sts.$d TXT record not found."
+                echo "__FAIL__"
+            fi
+
+            tlsrpt_expected="$(tlsrpt_expected_txt_for)"
+            tlsrpt_txt="$(resolvectl query --type=TXT "_smtp._tls.${d}" 2>/dev/null | grep -o 'v=TLSRPTv1[^"]*' || true)"
+            if [[ -n "$tlsrpt_txt" && "$tlsrpt_txt" == "$tlsrpt_expected" ]]; then
+                okline "_smtp._tls.$d TLSRPT TXT record found: $tlsrpt_txt"
+            elif [[ -n "$tlsrpt_txt" ]]; then
+                failline "_smtp._tls.$d TLSRPT TXT record present but does not match expected ('$tlsrpt_expected'): $tlsrpt_txt"
+                echo "__FAIL__"
+            else
+                failline "_smtp._tls.$d TLSRPT TXT record not found - run --setup to publish it."
                 echo "__FAIL__"
             fi
 
@@ -532,6 +572,70 @@ setup_mta_sts_txt()
     fi
 }
 
+# ============================================================
+# TLSRPT (RFC 8460) - see the header comment at the top of this file
+# for why this lives here alongside MTA-STS. One centralized rua
+# address for every domain, no per-domain policy file to hash (the
+# expected value is static unless the rua address itself changes), and
+# no wanted_domains() gate - applies to every active domain regardless
+# of whether this server also hosts that domain's mta-sts.<domain>
+# policy page.
+# ============================================================
+
+tlsrpt_rua_address()
+{
+    echo "postmaster@$(first_active_domain)"
+}
+
+tlsrpt_expected_txt_for()
+{
+    echo "v=TLSRPTv1; rua=mailto:$(tlsrpt_rua_address)"
+}
+
+setup_tlsrpt_txt()
+{
+    local dom="$1" name="_smtp._tls"
+    local expected actual="" dns_out live_ttl user key_file
+
+    expected="$(tlsrpt_expected_txt_for)"
+
+    if dns_out="$(resolvectl query --type=TXT "${name}.${dom}" 2>/dev/null)"; then
+        actual="$(grep -o 'v=TLSRPTv1[^"]*' <<< "$dns_out" | head -1 || true)"
+    fi
+
+    if [[ -n "$actual" && "$actual" == "$expected" ]]; then
+        [[ "$BRIEF" -eq 1 ]] || log "[ OK ] ${name}.${dom}: already matches."
+        return 0
+    fi
+
+    if ! have_transip_creds "$dom"; then
+        err "${name}.${dom}: $([[ -z "$actual" ]] && echo "no TXT record published" || echo "TXT record does not match") and no TransIP credentials are available to fix it."
+        err "  Publish as: ${name}.${dom}  TXT  \"${expected}\""
+        return 1
+    fi
+
+    require_cmd transip-dns
+    user="$(transip_user_for "$dom")"; key_file="$(transip_key_for "$dom")"
+
+    if [[ -z "$actual" ]]; then
+        log "Publishing ${name}.${dom}..."
+        transip-dns --username "$user" --key-file "$key_file" \
+            add "$dom" "$name" TXT "$expected" --ttl "$TLSRPT_DEFAULT_TTL"
+        log "[ OK ] Published ${name}.${dom}."
+        log "      TTL is ${TLSRPT_DEFAULT_TTL}s - resolvers (including this server's own"
+        log "      cache) may keep answering with no data for up to that long."
+    else
+        log "${name}.${dom} does not match - updating..."
+        live_ttl="$(transip_live_ttl_for "$dom" "$name" TXT)"
+        [[ -n "$live_ttl" ]] || die "Could not find ${name}.${dom}'s own live TTL via transip-dns list - refusing to guess one for update."
+        transip-dns --username "$user" --key-file "$key_file" \
+            update "$dom" "$name" TXT "$expected" --ttl "$live_ttl"
+        log "[ OK ] Updated ${name}.${dom}."
+        log "      TTL is ${live_ttl}s - resolvers (including this server's own cache) may"
+        log "      keep answering with the OLD value for up to that long."
+    fi
+}
+
 cmd_setup()
 {
     require_cmd resolvectl
@@ -554,9 +658,24 @@ cmd_setup()
         fi
     done
 
+    local -a all_domains=()
+    while read -r d; do [[ -n "$d" ]] && all_domains+=("$d"); done < <(all_active_domains)
+
+    local tlsrpt_failed=0
+    for d in "${all_domains[@]}"; do
+        domain_out="$(setup_tlsrpt_txt "$d" 2>&1)" && domain_failed=0 || domain_failed=1
+        tlsrpt_failed=$((tlsrpt_failed + domain_failed))
+        if [[ "$domain_failed" -eq 1 || "$BRIEF" -ne 1 ]]; then
+            echo
+            echo "=== $d (TLSRPT) ==="
+            printf '%s\n' "$domain_out"
+        fi
+    done
+    failed=$((failed + tlsrpt_failed))
+
     echo
     if [[ "$failed" -eq 0 ]]; then
-        log "[ OK ] _mta-sts TXT published/up to date for ${#domains[@]} domain(s)."
+        log "[ OK ] _mta-sts TXT published/up to date for ${#domains[@]} domain(s); _smtp._tls TLSRPT TXT published/up to date for ${#all_domains[@]} domain(s)."
     else
         err "$failed record(s) could not be published/updated automatically - see error lines above."
         return 1
@@ -576,19 +695,38 @@ cmd_report()
 
     local -a domains=()
     while read -r d; do [[ -n "$d" ]] && domains+=("$d"); done < <(wanted_domains)
-    [[ "${#domains[@]}" -gt 0 ]] || die "No mta-sts.<domain> hostname resolves to this server - nothing to report."
 
     local d expected
-    for d in "${domains[@]}"; do
-        expected="$(mta_sts_expected_txt_for "$d")" || { err "${d}: no local policy file yet - run --all first."; continue; }
-        echo "MTA-STS record for ${d}"
+    if [[ "${#domains[@]}" -eq 0 ]]; then
+        log "No mta-sts.<domain> hostname resolves to this server - nothing to report for MTA-STS."
+    else
+        for d in "${domains[@]}"; do
+            expected="$(mta_sts_expected_txt_for "$d")" || { err "${d}: no local policy file yet - run --all first."; continue; }
+            echo "MTA-STS record for ${d}"
+            echo "========================"
+            echo
+            echo "  Name:  _mta-sts.${d}"
+            echo "  Type:  TXT"
+            echo "  Value: \"${expected}\""
+            echo
+        done
+    fi
+
+    local -a all_domains=()
+    while read -r d; do [[ -n "$d" ]] && all_domains+=("$d"); done < <(all_active_domains)
+    [[ "${#all_domains[@]}" -gt 0 ]] || die "No active domains found (grommunio-admin domain list) - nothing to report."
+
+    expected="$(tlsrpt_expected_txt_for)"
+    for d in "${all_domains[@]}"; do
+        echo "TLSRPT record for ${d}"
         echo "========================"
         echo
-        echo "  Name:  _mta-sts.${d}"
+        echo "  Name:  _smtp._tls.${d}"
         echo "  Type:  TXT"
         echo "  Value: \"${expected}\""
         echo
     done
+
     echo "Publish these exact records at your DNS registrar."
     echo "Re-run manage-mta-sts.sh --status afterward to confirm they match."
 }
