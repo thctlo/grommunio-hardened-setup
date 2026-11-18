@@ -73,19 +73,34 @@
 #                                                  copy-paste-ready for a
 #                                                  registrar that needs it
 #                                                  added by hand.
+#   manage-dane.sh [-domain <name>] --teardown   Removes DANE entirely for
+#                                                  this domain: every live
+#                                                  TLSA record at
+#                                                  _25._tcp.<label>.<domain>
+#                                                  (both usage-types, a
+#                                                  clean sweep regardless of
+#                                                  scheme) and the domain's
+#                                                  own entry from
+#                                                  update-dane-tlsa.sh's
+#                                                  DANE_DOMAINS, so a future
+#                                                  cert renewal stops
+#                                                  touching it. Does not
+#                                                  remove the deploy-hook
+#                                                  itself or anything for
+#                                                  OTHER domains.
 #   --brief                                       Modifier for --status/
 #                                                  --report/--setup: only
 #                                                  [FAIL]/[WARN] lines and a
 #                                                  one-line summary, no
 #                                                  [ OK ] lines.
 #   --mail [<address>]                            Modifier for --status/
-#                                                  --report/--setup: also
-#                                                  emails the exact output
-#                                                  via this server's own
-#                                                  MTA. Default recipient
-#                                                  (no address given):
-#                                                  admin@<first active
-#                                                  domain> - the hub
+#                                                  --report/--setup/
+#                                                  --teardown: also emails
+#                                                  the exact output via this
+#                                                  server's own MTA. Default
+#                                                  recipient (no address
+#                                                  given): admin@<first
+#                                                  active domain> - the hub
 #                                                  mailbox step 31 creates.
 #   -scheme <rollover|issuer>                      Which double-TLSA
 #                                                  rollover scheme to use -
@@ -94,14 +109,15 @@
 #                                                  full explanation.
 #                                                  Default: rollover.
 #
-# --setup writes real DNS zone records (via transip-dns). The operator
-# runs this command themselves - an agent must never run --setup (this is
-# a standing, absolute rule for every DNS zone-record change in this
-# project, not specific to this script). The classifier that gates DNS/cert
-# changes at the tool layer may also prompt separately if an agent ever
-# attempts it regardless - that is a second, redundant backstop, not the
-# actual reason this is off-limits. An agent may run --status freely
-# (read-only) and should hand the operator the exact --setup command to
+# --setup and --teardown both write real DNS zone records (via
+# transip-dns) - the operator runs either themselves, an agent must
+# never run either (this is a standing, absolute rule for every DNS
+# zone-record change in this project, not specific to this script).
+# The classifier that gates DNS/cert changes at the tool layer may
+# also prompt separately if an agent ever attempts it regardless -
+# that is a second, redundant backstop, not the actual reason this is
+# off-limits. An agent may run --status/--report freely (read-only)
+# and should hand the operator the exact --setup/--teardown command to
 # run themselves.
 
 set -euo pipefail
@@ -161,7 +177,7 @@ DANE_SCHEME="${DANE_SCHEME:-rollover}"
 
 show_help()
 {
-    sed -n '3,98p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,121p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # dane_label_for() now lives in functions/00-common.sh - shared with
@@ -726,6 +742,79 @@ cmd_report()
 }
 
 # ============================================================
+# cmd_teardown: removes DANE entirely for one domain - every live
+# TLSA record at _25._tcp.<label>.<domain> (both usage-types, whatever
+# scheme is/was active - a clean sweep, not scheme-aware), and the
+# domain's own "domain:label" entry from update-dane-tlsa.sh's
+# DANE_DOMAINS (so a future cert renewal stops touching it). Does NOT
+# remove the deploy-hook itself or anything for OTHER domains still
+# in DANE_DOMAINS. Same standing rule as --setup: writes real DNS
+# zone records, the operator runs this themselves, never an agent.
+# ============================================================
+
+cmd_teardown()
+{
+    require_cmd openssl
+
+    local domain="$1" label target
+    [[ -n "$domain" ]] || die "No active domain found (grommunio-admin domain list) - run step 31 first."
+    label="$(dane_label_for "$domain")"
+    target="${label}.${domain}"
+
+    log "Removing all DANE/TLSA records for _25._tcp.${target}..."
+
+    local -a leftover=()
+    local up
+    for up in 3 2; do
+        while IFS= read -r line; do [[ -n "$line" ]] && leftover+=("$line"); done \
+            < <(tlsa_lookup_all "$domain" "$label" "$up")
+    done
+
+    if [[ "${#leftover[@]}" -eq 0 ]]; then
+        log "[ OK ] No TLSA record published at _25._tcp.${target} - nothing to remove there."
+    elif ! have_transip_creds "$domain"; then
+        local have
+        for have in "${leftover[@]}"; do
+            err "Remove by hand: _25._tcp.${target}  TLSA  ${have}"
+        done
+        return 1
+    else
+        require_cmd transip-dns
+        local user key_file have ttl rc=0
+        user="$(transip_user_for "$domain")"; key_file="$(transip_key_for "$domain")"
+        for have in "${leftover[@]}"; do
+            ttl="$(transip_live_ttl_for "$domain" "_25._tcp.${label}" TLSA)"
+            if ! transip-dns --username "$user" --key-file "$key_file" \
+                delete "$domain" "_25._tcp.${label}" TLSA "$have" --ttl "${ttl:-$TTL}"; then
+                err "Could not remove TLSA record '${have}' for _25._tcp.${target}."
+                rc=1
+                continue
+            fi
+            log "[ OK ] Removed TLSA record: ${have}"
+        done
+        [[ "$rc" -eq 0 ]] || return 1
+    fi
+
+    if grep -qF "\"${domain}:${label}\"" "$DANE_TLSA_SCRIPT" 2>/dev/null; then
+        log "Removing ${domain}:${label} from update-dane-tlsa.sh's DANE_DOMAINS..."
+        backup_file "$DANE_TLSA_SCRIPT"
+        sed -i "/\"${domain}:${label}\"/d" "$DANE_TLSA_SCRIPT"
+        bash -n "$DANE_TLSA_SCRIPT" || die "$DANE_TLSA_SCRIPT has a syntax error after editing - check it by hand."
+        finalize_backup "$DANE_TLSA_SCRIPT"
+        if [[ -x "$DEPLOY_HOOK" ]]; then
+            install -m 0755 "$DANE_TLSA_SCRIPT" "$DEPLOY_HOOK"
+        fi
+        log "[ OK ] Removed from DANE_DOMAINS and refreshed the deploy-hook."
+    else
+        log "[ OK ] ${domain} was not in update-dane-tlsa.sh's DANE_DOMAINS."
+    fi
+
+    log "[ OK ] DANE/TLSA fully removed for ${target}."
+    log "      Resolvers (including this server's own cache) may keep answering with"
+    log "      the old value for up to its own TTL."
+}
+
+# ============================================================
 # Argument parsing
 # ============================================================
 
@@ -749,6 +838,8 @@ while [[ $# -gt 0 ]]; do
             ACTION="setup"; shift ;;
         --report)
             ACTION="report"; shift ;;
+        --teardown)
+            ACTION="teardown"; shift ;;
         --brief)
             BRIEF=1; shift ;;
         --mail)
@@ -773,12 +864,13 @@ run_action()
         status) cmd_status "$TARGET_DOMAIN" ;;
         setup) require_root; cmd_setup "$TARGET_DOMAIN" ;;
         report) cmd_report "$TARGET_DOMAIN" ;;
+        teardown) require_root; cmd_teardown "$TARGET_DOMAIN" ;;
         "") show_help ;;
     esac
 }
 
 if [[ -n "$MAIL_TO" ]]; then
-    [[ -n "$ACTION" ]] || die "--mail needs an action (--status, --setup or --report)."
+    [[ -n "$ACTION" ]] || die "--mail needs an action (--status, --setup, --report or --teardown)."
     OUTPUT="$(run_action 2>&1)"
     printf '%s\n' "$OUTPUT"
     send_report_mail "$MAIL_TO" "manage-dane.sh ${ACTION} - ${TARGET_DOMAIN}" "$OUTPUT"
