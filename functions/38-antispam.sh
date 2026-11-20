@@ -867,6 +867,40 @@ if ! cmp -s "$OPT_NEW" "$OPT_CFG"; then
 fi
 rm -f "$OPT_NEW"
 
+# 4c. DNSSEC validation for Postfix's own DANE lookups. unbound above is
+#     dedicated to rspamd (127.0.0.1, access limited to loopback) - Postfix
+#     itself still resolves via /etc/resolv.conf -> systemd-resolved's stub
+#     (127.0.0.53), which by default does NOT validate DNSSEC and never sets
+#     the "ad" bit. Postfix's "options edns0 trust-ad" (set by postfix-script)
+#     only trusts that bit from a loopback resolver, so without this,
+#     DANE TLSA lookups never see a validated answer. allow-downgrade (not
+#     "yes"): validates where possible and sets "ad" correctly, but falls
+#     back to insecure per-lookup instead of hard-failing mail to a domain
+#     with a broken DNSSEC chain - found live 2026-11-20 right after a
+#     reboot, confirmed via `dig @127.0.0.53` missing the "ad" flag that
+#     `dig @127.0.0.1` (unbound) did have for the same signed name.
+local RESOLVED_DROPIN_DIR="/etc/systemd/resolved.conf.d"
+local RESOLVED_DROPIN="${RESOLVED_DROPIN_DIR}/10-dnssec.conf"
+mkdir -p "$RESOLVED_DROPIN_DIR"
+local RESOLVED_NEW
+RESOLVED_NEW="$(mktemp)"
+cat > "$RESOLVED_NEW" <<CONF
+[Resolve]
+DNSSEC=allow-downgrade
+CONF
+if ! cmp -s "$RESOLVED_NEW" "$RESOLVED_DROPIN"; then
+    install -m 0644 "$RESOLVED_NEW" "$RESOLVED_DROPIN"
+    log "[ OK ] Wrote $RESOLVED_DROPIN (DNSSEC=allow-downgrade)."
+    systemctl restart systemd-resolved || die "systemd-resolved did not restart after enabling DNSSEC."
+fi
+rm -f "$RESOLVED_NEW"
+sleep 1
+if ! dig @127.0.0.53 "${dkim_domains[0]}" MX 2>/dev/null | grep -qE '^;; flags:.*\bad\b'; then
+    log "[WARN] Could not confirm the \"ad\" (DNSSEC-validated) flag via the stub resolver (127.0.0.53) for ${dkim_domains[0]} - this may just mean that zone isn't DNSSEC-signed, not a config failure."
+else
+    log "[ OK ] Stub resolver (127.0.0.53) returns a DNSSEC-validated (\"ad\") answer."
+fi
+
 # 5. Check the config and restart
 if ! rspamadm configtest >/dev/null 2>&1; then
     die "rspamd config test fails (rspamadm configtest). Not restarting."
