@@ -155,7 +155,7 @@ CERT_NAME="$(discover_cert_name)"
 # this hook or 70-sync-ssl-key/80-grommunio-certbot-deploy-hook make
 # any SERVICE actually start using them.
 DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/60-update-dane-tlsa"
-TTL=3600
+TTL=300
 
 # DANE_SCHEME: which of Internet.nl's own two recommended double-TLSA
 # rollover schemes to publish - always exactly 2 records total, never

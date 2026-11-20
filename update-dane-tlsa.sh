@@ -135,7 +135,7 @@ set -euo pipefail
 CERT_DIR="${1:-${RENEWED_LINEAGE:-/etc/letsencrypt/live/mail.example.com}}"
 CERT_FILE="${CERT_DIR}/cert.pem"
 FULLCHAIN_FILE="${CERT_DIR}/fullchain.pem"
-TTL=3600
+TTL=300
 
 ACCOUNTS_DIR="/etc/letsencrypt/transip/accounts.d"
 
