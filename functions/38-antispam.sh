@@ -333,6 +333,50 @@ else
 fi
 rm -f "$COMP_NEW"
 
+# 1l. DMARC policy enforcement - by default the dmarc module's
+#     DMARC_POLICY_QUARANTINE/REJECT symbols only add a small score
+#     (1.5/2.0), the same weight class as any other weak signal - a
+#     domain's own published "p=quarantine"/"p=reject" policy was
+#     effectively being ignored. Confirmed live 2026-11-21: an external,
+#     unauthenticated sender forged `From: <a real local mailbox>` to
+#     itself; SPF hard-failed (the domain publishes -all) and
+#     DMARC_POLICY_QUARANTINE fired, but the total score (4.04) stayed
+#     under add_header (6) - delivered normally, no action taken.
+#     grommunio's own docs confirm this is by design and name the fix
+#     (an "actions" block in local.d/dmarc.conf), with one explicit
+#     caution: "Enable enforcement only after you have watched the
+#     DMARC_POLICY_* symbols on real mail for a while." Starting
+#     cautious per that advice: both quarantine and reject map to
+#     add_header, never straight to reject, so a domain with a stricter
+#     DMARC policy than its real mail flow can handle (e.g. a forwarder
+#     breaking alignment) never causes a hard bounce - only a flagged
+#     delivery visible in History to review before tightening further.
+local DMARC_CFG="/etc/rspamd/local.d/dmarc.conf"
+local DMARC_NEW
+DMARC_NEW="$(mktemp)"
+cat > "$DMARC_NEW" <<'CONF'
+# local.d/dmarc.conf (managed by 38-antispam.sh)
+# No outer dmarc{} wrapper here - modules.d/dmarc.conf already includes
+# this file FROM INSIDE its own dmarc{} block, so wrapping again nests it
+# (confirmed live: rspamadm configtest warns "nested section: dmarc {
+# dmarc { ... } }" if you do).
+actions {
+  quarantine = "add_header";
+  reject = "add_header";
+}
+CONF
+if ! cmp -s "$DMARC_NEW" "$DMARC_CFG"; then
+    if [[ -f "$DMARC_CFG" ]]; then
+        backup_file "$DMARC_CFG"
+    fi
+    install -m 0644 "$DMARC_NEW" "$DMARC_CFG"
+    finalize_backup "$DMARC_CFG"
+    log "[ OK ] Wrote $DMARC_CFG (DMARC quarantine/reject policy now forces at least add_header)."
+else
+    log "[ OK ] $DMARC_CFG already correct."
+fi
+rm -f "$DMARC_NEW"
+
 # 1b. milter headers: rspamd adds nothing to mail unless "use" lists the headers
 local MH_CFG="/etc/rspamd/local.d/milter_headers.conf"
 local MH_NEW
