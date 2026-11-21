@@ -221,5 +221,63 @@ if is_installed "nginx.service"; then
     log "[ OK ] nginx starts after its upstreams and their readiness units."
 fi
 
+# ============================================================
+# Restart-on-failure for Keycloak - a SEPARATE drop-in from the
+# ordering one above (20-, not 10-), since this is a different
+# concern: what to do when the dependency bounces WHILE this service
+# is already running, not just which order to start in at boot.
+#
+# Found live 2026-11-21: Keycloak's own packaged unit ships
+# Restart=no. A mariadb-server package upgrade briefly restarted
+# MariaDB (routine, self-heals for every other MariaDB-using service
+# here); Keycloak happened to also be (re)starting at that exact
+# moment, got "Failed to obtain JDBC connection", exited once, and
+# then just sat in "failed" - nothing ever retried it, so SSO stayed
+# down until someone noticed and restarted it by hand.
+#
+# Restart=on-failure (not "always") only fires on an actual crash/
+# non-zero exit - it is a no-op for a clean, deliberate stop, which is
+# exactly how dpkg stops a service before upgrading ITS OWN package
+# files (systemd never auto-restarts after an explicit `systemctl
+# stop`-style request, regardless of the Restart= policy - this is
+# true for every Restart= value, not just on-failure, precisely so a
+# service can always be stopped on purpose). So this change cannot
+# interfere with grommunio-keycloak's own package upgrades, including
+# a long one - it only ever acts on an unplanned crash.
+#
+# RestartSec=20 with StartLimitBurst=8 over a 300s window gives up to
+# ~8 retries - comfortably more than enough for the ~90s MariaDB
+# restart window seen live, while still giving up and staying visibly
+# "failed" (not an infinite loop) if something is genuinely broken for
+# longer than that.
+if is_installed "grommunio-keycloak.service"; then
+    local KC_RESTART_DIR="/etc/systemd/system/grommunio-keycloak.service.d"
+    local KC_RESTART_FILE="${KC_RESTART_DIR}/20-restart-on-failure.conf"
+    mkdir -p "$KC_RESTART_DIR"
+    backup_file "$KC_RESTART_FILE"
+    cat > "$KC_RESTART_FILE" <<'EOF'
+# Restart policy, written by 60-boot-order.sh. The packaged unit ships
+# Restart=no - this does not change the ordering drop-in (10-...), it
+# only makes an unplanned crash (e.g. the database being briefly
+# unavailable) retry instead of staying "failed" forever. A deliberate
+# stop (dpkg upgrading this same package) is unaffected either way.
+[Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=8
+
+[Service]
+Restart=on-failure
+RestartSec=20
+EOF
+    chmod 644 "$KC_RESTART_FILE"
+    finalize_backup "$KC_RESTART_FILE"
+    systemctl daemon-reload
+    if [[ "$(systemctl show grommunio-keycloak.service -p Restart --value)" == "on-failure" ]]; then
+        log "[ OK ] grommunio-keycloak now restarts on failure (was Restart=no)."
+    else
+        die "grommunio-keycloak Restart= override did not apply."
+    fi
+fi
+
 log "[ OK ] Boot order set. Test it with a reboot: the admin API must not report a database error at boot, and nginx must not return 502 at boot."
 }
