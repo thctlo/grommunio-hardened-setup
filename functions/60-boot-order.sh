@@ -279,5 +279,48 @@ EOF
     fi
 fi
 
+# ============================================================
+# Server-level safety net for nginx serving via a stale php-fpm
+# socket connection (see fix-nginx-stale-php-fpm.sh for the full root
+# cause): grommunio-web's own postinst only reloads nginx, never
+# restarts it, and nothing in a normal apt transaction restarts nginx
+# AFTER php8.4-fpm comes back up from its own package upgrade. A
+# reload cannot clear an already-stale keepalive connection to
+# php-fpm's old (now-replaced) socket - only a full restart does.
+#
+# Same DPkg::Post-Invoke reasoning as the keycloak.json fix above:
+# this must be the one hook apt guarantees runs after every
+# transaction's dpkg run (and all trigger processing) has fully
+# finished, not scoped to specific package names - some other future
+# package could cause the exact same symptom through a different
+# path, and this checks the real, actual symptom (can nginx still
+# reach php-fpm at all) rather than guessing which packages matter.
+# ============================================================
+
+if is_installed "nginx.service" && is_installed "php8.4-fpm.service"; then
+    local NGINX_HOOK_SCRIPT="/usr/local/sbin/fix-nginx-stale-php-fpm.sh"
+    local NGINX_HOOK_CONF="/etc/apt/apt.conf.d/99-grommunio-nginx-phpfpm-fix"
+
+    backup_file "$NGINX_HOOK_SCRIPT"
+    install -m 0755 "${SCRIPT_DIR}/fix-nginx-stale-php-fpm.sh" "$NGINX_HOOK_SCRIPT" \
+        || die "Could not install $NGINX_HOOK_SCRIPT."
+    finalize_backup "$NGINX_HOOK_SCRIPT"
+
+    backup_file "$NGINX_HOOK_CONF"
+    cat > "$NGINX_HOOK_CONF" <<EOF
+// Checks after every apt transaction, on this server, whether nginx
+// can still actually reach php-fpm - see $NGINX_HOOK_SCRIPT for the
+// full root cause. Does a full restart only if the check fails; a
+// no-op otherwise.
+// "|| true": a failure here must never fail or block an unrelated
+// apt transaction - matches the same guarantee already built into
+// the script itself.
+DPkg::Post-Invoke { "${NGINX_HOOK_SCRIPT} || true"; };
+EOF
+    chmod 644 "$NGINX_HOOK_CONF"
+    finalize_backup "$NGINX_HOOK_CONF"
+    log "[ OK ] Installed $NGINX_HOOK_SCRIPT and the apt Post-Invoke hook ($NGINX_HOOK_CONF)."
+fi
+
 log "[ OK ] Boot order set. Test it with a reboot: the admin API must not report a database error at boot, and nginx must not return 502 at boot."
 }
