@@ -377,6 +377,76 @@ else
 fi
 rm -f "$DMARC_NEW"
 
+# 1m. Outbound rate limiting - the ratelimit module ships loaded but
+#     with zero buckets configured, so by default it does nothing:
+#     nothing on this server limited how much mail a single
+#     authenticated (SASL) mailbox could send. A compromised account
+#     could otherwise be used to blast outbound spam with no
+#     throttling at all until the operator noticed.
+#
+#     Keyed by "user.lower" (the authenticated SASL login, lowercased)
+#     - grommunio-web/MAPI/mobile mail never reaches this at all
+#     (gromox hands outgoing mail to Postfix via its own
+#     outgoing_smtp_url, default sendmail://localhost - a local
+#     maildrop injection that never touches smtpd/SASL, confirmed via
+#     `man gromox.cfg`), so this only ever limits a raw SMTP client
+#     authenticating directly against submission/submissions, which is
+#     exactly the scenario being protected against.
+#
+#     Two tiers: a tight burst catches a fast script-driven blast, a
+#     looser hourly rate catches a slower but still abusive sustained
+#     send. Exceeding either soft-rejects (451, temp-fail) the
+#     message - no symbol/info_symbol set, so rspamd's own default
+#     (soft reject) action applies; a legitimate sender's own MUA
+#     retries automatically.
+#
+#     Verified live 2026-11-21 with a real test mailbox: rspamc-based
+#     testing (controller worker) never triggered this at all - the
+#     module only runs on the "normal" worker, the one actually used
+#     by real mail flow through the milter, confirmed via the rspamd
+#     log showing RATELIMIT_UPDATE only ever firing there. Switched to
+#     sending real messages through the real SMTP+SASL path instead
+#     (to the test mailbox itself, harmless). A deliberately tiny
+#     burst=3 confirmed the 4th rapid message got "451 4.7.1 Ratelimit
+#     "user_outbound" exceeded"; the real 30/150 values were then
+#     re-verified as a plain accept for normal, low-volume sending.
+local RL_CFG="/etc/rspamd/local.d/ratelimit.conf"
+local RL_NEW
+RL_NEW="$(mktemp)"
+cat > "$RL_NEW" <<'CONF'
+# local.d/ratelimit.conf (managed by 38-antispam.sh)
+# Protects against a compromised/authenticated mailbox being used to
+# send a flood of outbound mail - nothing else on this server limits
+# how much an authenticated SASL session can send. Two tiers: a tight
+# burst limit catches a fast script-driven blast, a looser hourly
+# limit catches a slower but still abusive sustained send. Exceeding
+# either soft-rejects (temp-fail) the message - no symbol/info_symbol
+# set, so rspamd's own default (soft reject) action applies; a
+# legitimate sender's own MUA retries automatically.
+rates {
+  user_outbound = {
+    selector = "user.lower";
+    bucket = [
+      { burst = 30; rate = "30 / 1m"; },
+      { burst = 150; rate = "150 / 1h"; }
+    ];
+  }
+}
+
+whitelisted_rcpts = "postmaster,mailer-daemon";
+CONF
+if ! cmp -s "$RL_NEW" "$RL_CFG"; then
+    if [[ -f "$RL_CFG" ]]; then
+        backup_file "$RL_CFG"
+    fi
+    install -m 0644 "$RL_NEW" "$RL_CFG"
+    finalize_backup "$RL_CFG"
+    log "[ OK ] Wrote $RL_CFG (per-authenticated-user outbound rate limit)."
+else
+    log "[ OK ] $RL_CFG already correct."
+fi
+rm -f "$RL_NEW"
+
 # 1b. milter headers: rspamd adds nothing to mail unless "use" lists the headers
 local MH_CFG="/etc/rspamd/local.d/milter_headers.conf"
 local MH_NEW
