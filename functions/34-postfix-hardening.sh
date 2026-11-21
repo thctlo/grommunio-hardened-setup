@@ -196,6 +196,84 @@ else
     log "Appended reject_unknown_helo_hostname to smtpd_helo_restrictions (was: '$CUR_HELO_RESTRICTIONS')."
 fi
 
+# Anti-spoofing: reject mail claiming to come FROM one of our own
+# hosted domains when the connection never authenticated and isn't
+# from our own network. Found live 2026-11-21: an external,
+# unauthenticated sender forged a From:/MAIL FROM address using one of
+# our own domains, sent to itself (classic self-send spoof) - SPF
+# hard-failed and the domain's own DMARC policy says "quarantine", but
+# score-based filtering alone let it through with "no action" (see
+# 38-antispam.sh's DMARC actions fix for that half of the response).
+# Checked grommunio's own documentation (the offline PDF guide and the
+# live docs.grommunio.com site, both 2026-11-21) for an equivalent
+# recipe - neither has one. This is a standard, generic Postfix
+# hardening measure added on top, not something grommunio ships or
+# tests itself - re-verify this step's effect by hand after any
+# postfix or grommunio upgrade.
+#
+# Reuses the SAME MySQL domains table grommunio's own
+# virtual_mailbox_domains map already queries - the credentials are
+# read at runtime from grommunio's own .cf file, NEVER hardcoded here,
+# and the domain list can never drift from whatever grommunio itself
+# considers "ours" (a newly added/removed domain is picked up
+# automatically, no second list to maintain - the exact kind of drift
+# bug already hit once with DANE_DOMAINS, see that memory).
+#
+# Appended at the END of smtpd_sender_restrictions (append-only, like
+# the other restrictions above) - permit_sasl_authenticated and
+# permit_mynetworks already run earlier in the existing list, so an
+# authenticated user or a message from our own trusted network always
+# gets an immediate OK before this check is ever reached. Verified
+# live 2026-11-21 with a raw SMTP session from outside mynetworks,
+# unauthenticated: claiming a real local mailbox's own domain as
+# MAIL FROM now gets "554 5.7.1 ... Sender domain is locally hosted
+# and requires authentication" before DATA; a genuine external sender
+# (e.g. someone@gmail.com) to the same recipient still gets "250 Ok" -
+# confirmed inbound mail from real senders is unaffected.
+local GROMMUNIO_VMD_CF="/etc/postfix/grommunio-virtual-mailbox-domains.cf"
+local SENDER_BLOCK_CF="/etc/postfix/local-domain-sender-block.cf"
+if [[ -f "$GROMMUNIO_VMD_CF" ]]; then
+    local vmd_user vmd_pass vmd_hosts vmd_dbname
+    vmd_user="$(awk -F'= *' '/^[[:space:]]*user[[:space:]]*=/{print $2}' "$GROMMUNIO_VMD_CF")"
+    vmd_pass="$(awk -F'= *' '/^[[:space:]]*password[[:space:]]*=/{print $2}' "$GROMMUNIO_VMD_CF")"
+    vmd_hosts="$(awk -F'= *' '/^[[:space:]]*hosts[[:space:]]*=/{print $2}' "$GROMMUNIO_VMD_CF")"
+    vmd_dbname="$(awk -F'= *' '/^[[:space:]]*dbname[[:space:]]*=/{print $2}' "$GROMMUNIO_VMD_CF")"
+    if [[ -n "$vmd_user" && -n "$vmd_pass" && -n "$vmd_hosts" && -n "$vmd_dbname" ]]; then
+        local SENDER_BLOCK_NEW
+        SENDER_BLOCK_NEW="$(mktemp)"
+        cat > "$SENDER_BLOCK_NEW" <<SBCONF
+user = ${vmd_user}
+password = ${vmd_pass}
+hosts = ${vmd_hosts}
+dbname = ${vmd_dbname}
+query = SELECT 'REJECT Sender domain is locally hosted and requires authentication' FROM domains WHERE domain_status=0 AND domainname=_utf8mb4'%s' COLLATE utf8mb4_general_ci
+SBCONF
+        if ! cmp -s "$SENDER_BLOCK_NEW" "$SENDER_BLOCK_CF"; then
+            [[ "$changed" -eq 1 ]] || backup_file "$MAIN_CF"
+            install -m 0600 -o root -g root "$SENDER_BLOCK_NEW" "$SENDER_BLOCK_CF"
+            log "[ OK ] Wrote $SENDER_BLOCK_CF (reuses grommunio's own domains table, credentials read from $GROMMUNIO_VMD_CF)."
+        else
+            log "[ OK ] $SENDER_BLOCK_CF already correct."
+        fi
+        rm -f "$SENDER_BLOCK_NEW"
+
+        local CUR_SENDER_RESTRICTIONS2
+        CUR_SENDER_RESTRICTIONS2="$(postconf -h smtpd_sender_restrictions)"
+        if grep -qF "check_sender_access mysql:${SENDER_BLOCK_CF}" <<< "$CUR_SENDER_RESTRICTIONS2"; then
+            log "[ OK ] smtpd_sender_restrictions already has the local-domain sender-spoof check."
+        else
+            [[ "$changed" -eq 1 ]] || backup_file "$MAIN_CF"
+            postconf -e "smtpd_sender_restrictions = ${CUR_SENDER_RESTRICTIONS2:+$CUR_SENDER_RESTRICTIONS2,}check_sender_access mysql:${SENDER_BLOCK_CF}"
+            changed=1
+            log "Appended check_sender_access (local-domain sender-spoof block) to smtpd_sender_restrictions."
+        fi
+    else
+        log "[WARN] Could not read DB credentials from $GROMMUNIO_VMD_CF - skipping the local-domain sender-spoof block."
+    fi
+else
+    log "[WARN] $GROMMUNIO_VMD_CF not found - skipping the local-domain sender-spoof block (grommunio's own virtual_mailbox_domains map is missing or installed elsewhere)."
+fi
+
 # myhostname override: Postfix's OWN identity (HELO/EHLO, SASL domain,
 # banner) - only set explicitly when step 10 determined a SEPARATE
 # mx-hostname (NEW_MX_FQDN, found via PTR or --mx-hostname), which must
