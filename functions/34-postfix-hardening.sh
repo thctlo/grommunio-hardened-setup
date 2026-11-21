@@ -274,6 +274,84 @@ else
     log "[WARN] $GROMMUNIO_VMD_CF not found - skipping the local-domain sender-spoof block (grommunio's own virtual_mailbox_domains map is missing or installed elsewhere)."
 fi
 
+# reject_authenticated_sender_login_mismatch: an authenticated SASL
+# session may only use its OWN address as MAIL FROM, never impersonate
+# another local mailbox. Needs smtpd_sender_login_maps - grommunio's
+# SASL login is always the mailbox's own full address, so a plain
+# identity map (any login maps to itself) is correct, no per-user list
+# to maintain.
+#
+# Verified this does NOT affect grommunio-web/MAPI/mobile "send as" for
+# shared mailboxes: gromox's own outgoing_smtp_url defaults to
+# "sendmail://localhost" (confirmed via `man gromox.cfg`), meaning that
+# mail is injected straight into Postfix's local maildrop queue - it
+# never goes through smtpd/SASL at all. This restriction can therefore
+# only ever apply to a RAW SMTP client connecting directly to
+# submission(587)/submissions(465) with AUTH, exactly the case it is
+# meant to restrict. The mail log showed zero successful SASL logins
+# from any real client over the preceding 30 days (only failed
+# brute-force attempts) - essentially no existing traffic to break.
+#
+# Verified live 2026-11-21 with a real test mailbox: authenticated as
+# itself + MAIL FROM itself -> RCPT TO 250; authenticated as itself +
+# MAIL FROM a different real mailbox -> RCPT TO 553 "Sender address
+# rejected: not owned by user ...". (Postfix's smtpd_delay_reject
+# default means MAIL FROM alone always answers 250 regardless - the
+# actual check only fires at RCPT TO, confirmed while debugging why an
+# initial test without RCPT TO looked like it was not working.)
+#
+# Must be inserted BEFORE permit_sasl_authenticated, not appended at
+# the end like the checks above - permit_sasl_authenticated grants an
+# immediate OK, so this restriction has to run first to have any
+# effect for an authenticated session.
+local SENDER_LOGIN_MAP="/etc/postfix/sender_login_maps.regexp"
+local SENDER_LOGIN_MAP_NEW
+SENDER_LOGIN_MAP_NEW="$(mktemp)"
+cat > "$SENDER_LOGIN_MAP_NEW" <<'MAPEOF'
+# Identity map for smtpd_sender_login_maps (managed by
+# 34-postfix-hardening.sh), used together with
+# reject_authenticated_sender_login_mismatch: the authenticated SASL
+# login IS the only address that login may use as MAIL FROM.
+# grommunio's SASL login is always the full mailbox address, so a
+# plain identity map is correct here - no separate list to maintain.
+/^(.+)$/ $1
+MAPEOF
+if ! cmp -s "$SENDER_LOGIN_MAP_NEW" "$SENDER_LOGIN_MAP"; then
+    [[ -f "$SENDER_LOGIN_MAP" ]] && backup_file "$SENDER_LOGIN_MAP"
+    install -m 0644 "$SENDER_LOGIN_MAP_NEW" "$SENDER_LOGIN_MAP"
+    finalize_backup "$SENDER_LOGIN_MAP"
+    log "[ OK ] Wrote $SENDER_LOGIN_MAP."
+else
+    log "[ OK ] $SENDER_LOGIN_MAP already correct."
+fi
+rm -f "$SENDER_LOGIN_MAP_NEW"
+
+if [[ "$(postconf -h smtpd_sender_login_maps)" != "regexp:${SENDER_LOGIN_MAP}" ]]; then
+    [[ "$changed" -eq 1 ]] || backup_file "$MAIN_CF"
+    postconf -e "smtpd_sender_login_maps = regexp:${SENDER_LOGIN_MAP}"
+    changed=1
+    log "Set smtpd_sender_login_maps = regexp:${SENDER_LOGIN_MAP}."
+else
+    log "[ OK ] smtpd_sender_login_maps already set."
+fi
+
+local CUR_SENDER_RESTRICTIONS3
+CUR_SENDER_RESTRICTIONS3="$(postconf -h smtpd_sender_restrictions)"
+if grep -qw 'reject_authenticated_sender_login_mismatch' <<< "$CUR_SENDER_RESTRICTIONS3"; then
+    log "[ OK ] smtpd_sender_restrictions already has reject_authenticated_sender_login_mismatch."
+else
+    [[ "$changed" -eq 1 ]] || backup_file "$MAIN_CF"
+    local NEW_SENDER_RESTRICTIONS3
+    if grep -qw 'permit_sasl_authenticated' <<< "$CUR_SENDER_RESTRICTIONS3"; then
+        NEW_SENDER_RESTRICTIONS3="$(sed -E 's/(^|,)permit_sasl_authenticated(,|$)/\1reject_authenticated_sender_login_mismatch,permit_sasl_authenticated\2/' <<< "$CUR_SENDER_RESTRICTIONS3")"
+    else
+        NEW_SENDER_RESTRICTIONS3="reject_authenticated_sender_login_mismatch${CUR_SENDER_RESTRICTIONS3:+,$CUR_SENDER_RESTRICTIONS3}"
+    fi
+    postconf -e "smtpd_sender_restrictions = ${NEW_SENDER_RESTRICTIONS3}"
+    changed=1
+    log "Inserted reject_authenticated_sender_login_mismatch before permit_sasl_authenticated in smtpd_sender_restrictions."
+fi
+
 # myhostname override: Postfix's OWN identity (HELO/EHLO, SASL domain,
 # banner) - only set explicitly when step 10 determined a SEPARATE
 # mx-hostname (NEW_MX_FQDN, found via PTR or --mx-hostname), which must
