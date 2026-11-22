@@ -165,15 +165,33 @@ rm -f "$AV_NEW"
 #     found as a stale failed unit after a routine apt upgrade
 #     (clamav-freshclam-once.timer fires once right after any
 #     clamav-freshclam package upgrade, independent of whether the
-#     continuous daemon is already running). Purely cosmetic (the
-#     virus database itself stays current via the daemon either way)
-#     but noisy in `systemctl --failed`, and would recur daily
-#     forever if left enabled.
+#     continuous daemon is already running). Purely cosmetic on an
+#     already-running server (the virus database stays current via
+#     the daemon either way) but noisy in `systemctl --failed`, and
+#     would recur daily forever if left enabled.
+#
+#     Before disabling it for good, let it actually do its one real
+#     job once: on a BRAND NEW install (not this server's own
+#     already-current case, but the point of this step is to work
+#     correctly there too) the continuous daemon may not have fetched
+#     the database yet, so a genuine one-time update here matters.
+#     Running it while the daemon is up always fails with the lock
+#     error above, so the daemon is stopped just long enough for one
+#     successful freshclam run, then restarted - verified live
+#     2026-11-22: stop, a clean `freshclam` exit 0 confirming the
+#     database is current, daemon back to "active" within 2 seconds.
 if systemctl is-enabled --quiet clamav-freshclam-once.timer 2>/dev/null; then
+    systemctl stop clamav-freshclam
+    if ! /usr/bin/freshclam; then
+        systemctl start clamav-freshclam || true
+        die "The one-time freshclam run failed - clamav-freshclam.service restarted, clamav-freshclam-once.timer left enabled for now."
+    fi
+    systemctl start clamav-freshclam \
+        || die "clamav-freshclam.service did not restart after the one-time freshclam run."
     systemctl disable --now clamav-freshclam-once.timer \
         || die "Could not disable clamav-freshclam-once.timer."
     systemctl reset-failed clamav-freshclam-once.service 2>/dev/null || true
-    log "[ OK ] Disabled clamav-freshclam-once.timer (redundant with clamav-freshclam.service)."
+    log "[ OK ] Ran freshclam once, then disabled clamav-freshclam-once.timer (redundant with clamav-freshclam.service going forward)."
 else
     log "[ OK ] clamav-freshclam-once.timer already disabled (or not installed)."
 fi
