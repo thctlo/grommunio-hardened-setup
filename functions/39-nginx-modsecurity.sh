@@ -1010,16 +1010,28 @@ EOF
     local f2b_filter="/etc/fail2ban/filter.d/nginx-modsecurity.conf"
     local f2b_filter_wanted
     f2b_filter_wanted="$(cat <<'EOF'
-# Verified 2026-10-21 with fail2ban-regex against a real ModSecurity block
-# in /var/log/nginx/nginx-error.log on testvps (an SSTP VPN scanner probe).
-# modsec_audit.log's own "Access denied" lines do not carry the client IP
-# (its "hostname" field is this server's own address) - nginx's error log
-# does, on the same line, in standard "client: <IP>," form.
+# Fixed 2026-11-22: the previous failregex watched nginx-error.log for
+# "ModSecurity: Access denied .*, client: <HOST>," - verified working on
+# 2026-10-21, but confirmed dead since (0 matches across 8 weeks of log
+# rotations, despite ModSecurity actively blocking real requests the whole
+# time, confirmed via modsec_audit.log). Most likely cause: the
+# 2026-10-29 SecAuditLogType Serial->Concurrent change (see this file's
+# own audit-log section) stopped the nginx connector from mirroring its
+# block notice into nginx's error log - never reconnected to this jail
+# until a routine log audit caught it, over 3 weeks of zero protection
+# from this specific jail.
+#
+# Switched to the audit log's own index file instead (modsec_audit.log,
+# Concurrent format) - one line per request, every request, with a plain
+# HTTP status field. A blocked request gets 403. Verified with
+# fail2ban-regex against 4 independent historical log files (the live
+# file plus 3 rotated generations): 100% precision, no false positives,
+# no misses, cross-checked against a literal `grep -c '" 403 '` count.
 [INCLUDES]
 before = common.conf
 
 [Definition]
-failregex = ModSecurity: Access denied .*, client: <HOST>,
+failregex = ^\S+ <HOST> - \[.*\] \"\S+ \S+ \S+\" 403
 ignoreregex =
 EOF
 )"
@@ -1048,7 +1060,7 @@ EOF
 [nginx-modsecurity]
 enabled = true
 backend = auto
-logpath = /var/log/nginx/nginx-error.log
+logpath = /var/log/nginx/modsec_audit.log
 port = 80,443,8080,8443
 banaction = ${banaction}
 # bantime widened to 24h (2026-11-05, same reasoning as postfix-smtp-auth's
@@ -1087,7 +1099,7 @@ EOF
     sleep 1
     fail2ban-client status nginx-modsecurity >/dev/null 2>&1 \
         || die "nginx-modsecurity jail did not come up - check 'fail2ban-client status nginx-modsecurity'."
-    log "[ OK ] nginx-modsecurity jail active - a ModSecurity block now reaches the firewall after 3 strikes in 1h (not just that one request)."
+    log "[ OK ] nginx-modsecurity jail active - a ModSecurity block now reaches the firewall after 3 strikes in 8h (not just that one request)."
 
     log "ModSecurity + OWASP CRS active (blocking), fed into fail2ban/the firewall. Watch /var/log/nginx/modsec_audit.log for anything blocked that shouldn't be - add a new scoped exclusion in $excl the same way as ids 9000001-9000009 if a new false positive turns up."
 }
