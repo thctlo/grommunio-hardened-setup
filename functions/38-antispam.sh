@@ -154,6 +154,30 @@ else
 fi
 rm -f "$AV_NEW"
 
+# 1n. clamav-freshclam-once.timer disabled - redundant with the
+#     continuously-running clamav-freshclam.service (which already
+#     keeps the virus database current on its own), and the two
+#     always conflict: freshclam keeps an exclusive lock on
+#     /var/log/clamav/freshclam.log for as long as it runs, so the
+#     "once" unit's daily attempt to also open that same log file
+#     fails every time with "Failed to lock the log file ...
+#     Resource temporarily unavailable" - confirmed live 2026-11-22,
+#     found as a stale failed unit after a routine apt upgrade
+#     (clamav-freshclam-once.timer fires once right after any
+#     clamav-freshclam package upgrade, independent of whether the
+#     continuous daemon is already running). Purely cosmetic (the
+#     virus database itself stays current via the daemon either way)
+#     but noisy in `systemctl --failed`, and would recur daily
+#     forever if left enabled.
+if systemctl is-enabled --quiet clamav-freshclam-once.timer 2>/dev/null; then
+    systemctl disable --now clamav-freshclam-once.timer \
+        || die "Could not disable clamav-freshclam-once.timer."
+    systemctl reset-failed clamav-freshclam-once.service 2>/dev/null || true
+    log "[ OK ] Disabled clamav-freshclam-once.timer (redundant with clamav-freshclam.service)."
+else
+    log "[ OK ] clamav-freshclam-once.timer already disabled (or not installed)."
+fi
+
 # 1g. Local sender whitelist/blacklist, user's request 2026-10-22: a ready-to-
 #     edit setup, not yet populated with real entries (the map files ship
 #     with one commented-out example each, so a real entry is a straight
